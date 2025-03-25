@@ -31,6 +31,7 @@ def update_summary(
         epoch,
         train_metrics,
         eval_metrics,
+        ema_eval_metrics,
         filename,
         lr=None,
         write_header=False,
@@ -39,6 +40,8 @@ def update_summary(
     rowd = OrderedDict(epoch=epoch)
     rowd.update([('train_' + k, v) for k, v in train_metrics.items()])
     rowd.update([('eval_' + k, v) for k, v in eval_metrics.items()])
+    if ema_eval_metrics is not None:
+        rowd.update([('ema_eval_' + k, v) for k, v in ema_eval_metrics.items()])
     if lr is not None:
         rowd['lr'] = lr
     if log_wandb:

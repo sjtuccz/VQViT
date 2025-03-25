@@ -17,6 +17,8 @@ Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 import argparse
 import logging
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import time
 from collections import OrderedDict
 from contextlib import suppress
@@ -34,10 +36,14 @@ from timm.data import create_dataset, create_loader, resolve_data_config, Mixup,
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
 from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
-from timm.optim import create_optimizer_v2, optimizer_kwargs
+from timm.optim import create_optimizer_v2, optimizer_kwargs, param_group_fn_with_weight_decay
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
-
+from timm.data.constants import CIFAR10_MEAN, CIFAR10_STD, CIFAR100_TRAIN_MEAN, CIFAR100_TRAIN_STD, TINY_IMAGENET_MEAN, TINY_IMAGENET_STD,IMAGENET_DEFAULT_MEAN,IMAGENET_DEFAULT_STD
+# CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
+# CIFAR10_STD = (0.2471, 0.2435, 0.2616)
+# CIFAR100_TRAIN_MEAN = [0.5071, 0.4867, 0.4408]#(0.5070751592371323, 0.48654887331495095, 0.4409178433670343)
+# CIFAR100_TRAIN_STD =  [0.2675, 0.2565, 0.2761]#(0.2673342858792401, 0.2564384629170883, 0.27615047132568404)
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -103,6 +109,8 @@ group.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
                    help='Name of model to train (default: "resnet50")')
 group.add_argument('--pretrained', action='store_true', default=False,
                    help='Start with pretrained version of specified network (if avail)')
+group.add_argument('--pretrained-finetune', action='store_true', default=False,
+                   help='use different lr for pretrained layers and head (default: False)')
 group.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
                    help='Initialize model from this checkpoint (default: none)')
 group.add_argument('--resume', default='', type=str, metavar='PATH',
@@ -120,7 +128,7 @@ group.add_argument('--in-chans', type=int, default=None, metavar='N',
 group.add_argument('--input-size', default=None, nargs=3, type=int,
                    metavar='N N N',
                    help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
-group.add_argument('--crop-pct', default=None, type=float,
+group.add_argument('--crop-pct', default=0.875, type=float,
                    metavar='N', help='Input image center crop percent (for validation only)')
 group.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
                    help='Override mean pixel value of dataset')
@@ -183,9 +191,11 @@ group.add_argument('--sched-on-updates', action='store_true', default=False,
                    help='Apply LR scheduler step on update instead of epoch end.')
 group.add_argument('--lr', type=float, default=None, metavar='LR',
                    help='learning rate, overrides lr-base if set (default: None)')
+group.add_argument('--lr-decay', type=float, default=0.01, metavar='LR',
+                   help='lr-decay for pretrained finetune, other layer (default: other_layer_lr/head_lr=0.01')
 group.add_argument('--lr-base', type=float, default=0.1, metavar='LR',
                    help='base learning rate: lr = lr_base * global_batch_size / base_size')
-group.add_argument('--lr-base-size', type=int, default=256, metavar='DIV',
+group.add_argument('--lr-base-size', type=int, default=128, metavar='DIV',
                    help='base learning rate batch size (divisor, default: 256).')
 group.add_argument('--lr-base-scale', type=str, default='', metavar='SCALE',
                    help='base learning rate vs batch_size scaling ("linear", "sqrt", based on opt if empty)')
@@ -221,7 +231,7 @@ group.add_argument('--warmup-epochs', type=int, default=5, metavar='N',
                    help='epochs to warmup LR, if scheduler supports')
 group.add_argument('--warmup-prefix', action='store_true', default=False,
                    help='Exclude warmup period from decay schedule.'),
-group.add_argument('--cooldown-epochs', type=int, default=0, metavar='N',
+group.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
                    help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
 group.add_argument('--patience-epochs', type=int, default=10, metavar='N',
                    help='patience epochs for Plateau LR scheduler (default: 10)')
@@ -232,7 +242,7 @@ group.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RAT
 group = parser.add_argument_group('Augmentation and regularization parameters')
 group.add_argument('--no-aug', action='store_true', default=False,
                    help='Disable all training augmentation, override other train aug args')
-group.add_argument('--scale', type=float, nargs='+', default=[0.08, 1.0], metavar='PCT',
+group.add_argument('--scale', type=float, nargs='+', default=[0.75, 1.0], metavar='PCT',
                    help='Random resize scale (default: 0.08 1.0)')
 group.add_argument('--ratio', type=float, nargs='+', default=[3. / 4., 4. / 3.], metavar='RATIO',
                    help='Random resize aspect ratio (default: 0.75 1.33)')
@@ -242,7 +252,7 @@ group.add_argument('--vflip', type=float, default=0.,
                    help='Vertical flip training aug probability')
 group.add_argument('--color-jitter', type=float, default=0.4, metavar='PCT',
                    help='Color jitter factor (default: 0.4)')
-group.add_argument('--aa', type=str, default=None, metavar='NAME',
+group.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
                    help='Use AutoAugment policy. "v0" or "original". (default: None)'),
 group.add_argument('--aug-repeats', type=float, default=0,
                    help='Number of augmentation repetitions (distributed training only) (default: 0)')
@@ -254,7 +264,7 @@ group.add_argument('--bce-loss', action='store_true', default=False,
                    help='Enable BCE loss w/ Mixup/CutMix use.')
 group.add_argument('--bce-target-thresh', type=float, default=None,
                    help='Threshold for binarizing softened BCE targets (default: None, disabled)')
-group.add_argument('--reprob', type=float, default=0., metavar='PCT',
+group.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
                    help='Random erase prob (default: 0.)')
 group.add_argument('--remode', type=str, default='pixel',
                    help='Random erase mode (default: "pixel")')
@@ -262,9 +272,9 @@ group.add_argument('--recount', type=int, default=1,
                    help='Random erase count (default: 1)')
 group.add_argument('--resplit', action='store_true', default=False,
                    help='Do not random erase first (clean) augmentation split')
-group.add_argument('--mixup', type=float, default=0.0,
+group.add_argument('--mixup', type=float, default=1.0,
                    help='mixup alpha, mixup enabled if > 0. (default: 0.)')
-group.add_argument('--cutmix', type=float, default=0.0,
+group.add_argument('--cutmix', type=float, default=1.0,
                    help='cutmix alpha, cutmix enabled if > 0. (default: 0.)')
 group.add_argument('--cutmix-minmax', type=float, nargs='+', default=None,
                    help='cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)')
@@ -323,7 +333,7 @@ group.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                    help='how many batches to wait before writing recovery checkpoint')
 group.add_argument('--checkpoint-hist', type=int, default=10, metavar='N',
                    help='number of checkpoints to keep (default: 10)')
-group.add_argument('-j', '--workers', type=int, default=4, metavar='N',
+group.add_argument('-j', '--workers', type=int, default=8, metavar='N',
                    help='how many training processes to use (default: 4)')
 group.add_argument('--save-images', action='store_true', default=False,
                    help='save images of input bathes every log interval for debugging')
@@ -355,6 +365,8 @@ group.add_argument('--use-multi-epochs-loader', action='store_true', default=Fal
 group.add_argument('--log-wandb', action='store_true', default=False,
                    help='log training and validation metrics to wandb')
 
+parser.add_argument('--eval-checkpoint', default='', type=str, metavar='PATH',
+                    help='path to eval checkpoint (default: none)')
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -420,6 +432,31 @@ def main():
     elif args.input_size is not None:
         in_chans = args.input_size[0]
 
+    if 'cifar100' in args.dataset:
+        # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/'
+        args.data_dir = '../../pytorch-cifar100-master/data/'
+        args.mean = CIFAR100_TRAIN_MEAN
+        args.std = CIFAR100_TRAIN_STD
+        args.num_classes = 100
+    elif 'cifar10' in args.dataset:
+        args.data_dir = '../../pytorch-cifar100-master/data/cifar10download/'
+        args.mean = CIFAR10_MEAN
+        args.std = CIFAR10_STD
+        args.num_classes = 10
+    elif 'tiny-imagenet' in args.dataset:
+        args.data_dir = '../../tiny-imagenet-200/'
+        args.mean = IMAGENET_DEFAULT_MEAN#TINY_IMAGENET_MEAN
+        args.std = IMAGENET_DEFAULT_STD#TINY_IMAGENET_STD
+        args.num_classes = 200
+    elif 'imagenet1k' in args.dataset:
+        args.data_dir = '../../ImageNet2012/'
+        args.mean = IMAGENET_DEFAULT_MEAN
+        args.std = IMAGENET_DEFAULT_STD
+        args.num_classes = 1000
+    else:
+        raise NotImplementedError(f'Unknown dataset {args.dataset}')
+    _logger.info(
+            f'Data: {args.dataset}, num classes: {args.num_classes}')
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -435,6 +472,70 @@ def main():
         checkpoint_path=args.initial_checkpoint,
         **args.model_kwargs,
     )
+    # def modify_model_param(model, layer_name_1, layer_name_2, param_name, isZero=False):
+    #     if param_name not in ['weight', 'bias']:
+    #         raise ValueError("Only 'weight' and 'bias' parameters can be modified.")
+    #     def get_layer_by_path(model, path):
+    #         layers = path.split('.')  # 根据点分隔路径
+    #         layer = model
+    #         for part in layers:
+    #             layer = getattr(layer, part)  # 动态获取每一层
+    #         return layer
+    #     try:
+    #         layer_2 = get_layer_by_path(model, layer_name_2)
+    #         param_2 = getattr(layer_2, param_name)
+    #         if isZero:
+    #             param_2.data.fill_(0)
+    #             print(f"Successfully set 0 to {layer_name_2}.{param_2}")
+    #             return
+    #         layer_1 = get_layer_by_path(model, layer_name_1)
+    #           # 获取目标层
+    #         param_1 = getattr(layer_1, param_name)
+    #         if param_1.shape != param_2.shape:
+    #             raise ValueError(f"The shapes of {param_name} in {layer_name_1} and {layer_name_2} do not match.")
+    #         setattr(layer_2, param_name, param_1)
+    #         print(f"Successfully copied {param_name} from {layer_name_1} to {layer_name_2}")
+    #     except AttributeError:
+    #         raise AttributeError(f"Layer or parameter '{layer_name_1}' or '{layer_name_2}' with name '{param_name}' not found in the model.")
+    
+    # modify_model_param(model,'blocks.7.mlp.fc1','blocks.8.mlp.fc1','bias')
+    # modify_model_param(model,'blocks.7.mlp.fc2','blocks.8.mlp.fc2','bias')
+    # modify_model_param(model,'blocks.7.mlp.fc1','blocks.8.mlp.fc1','weight')
+    # modify_model_param(model,'blocks.7.mlp.fc2','blocks.8.mlp.fc2','weight')
+
+    # modify_model_param(model,'blocks.7.attn.qkv','blocks.8.attn.qkv','weight')
+    # modify_model_param(model,'blocks.7.attn.qkv','blocks.8.attn.qkv','bias')
+
+    # modify_model_param(model,'blocks.7.attn.proj','blocks.8.attn.proj','weight')
+    # modify_model_param(model,'blocks.7.attn.proj','blocks.8.attn.proj','bias')
+
+    # modify_model_param(model,'blocks.7.norm2','blocks.8.norm2','weight')
+    # modify_model_param(model,'blocks.7.norm2','blocks.8.norm2','bias')
+
+    # modify_model_param(model,'blocks.7.norm1','blocks.8.norm1','weight')
+    # modify_model_param(model,'blocks.7.norm1','blocks.8.norm1','bias')
+
+
+
+
+    # modify_model_param(model,'blocks.9.mlp.fc1','blocks.10.mlp.fc1','bias')
+    # modify_model_param(model,'blocks.9.mlp.fc2','blocks.10.mlp.fc2','bias')
+    # modify_model_param(model,'blocks.9.mlp.fc1','blocks.10.mlp.fc1','weight')
+    # modify_model_param(model,'blocks.9.mlp.fc2','blocks.10.mlp.fc2','weight')
+
+    # modify_model_param(model,'blocks.9.attn.qkv','blocks.10.attn.qkv','weight')
+    # modify_model_param(model,'blocks.9.attn.qkv','blocks.10.attn.qkv','bias')
+
+    # modify_model_param(model,'blocks.9.attn.proj','blocks.10.attn.proj','weight')
+    # modify_model_param(model,'blocks.9.attn.proj','blocks.10.attn.proj','bias')
+
+    # modify_model_param(model,'blocks.9.norm2','blocks.10.norm2','weight')
+    # modify_model_param(model,'blocks.9.norm2','blocks.10.norm2','bias')
+
+    # modify_model_param(model,'blocks.9.norm1','blocks.10.norm1','weight')
+    # modify_model_param(model,'blocks.9.norm1','blocks.10.norm1','bias')
+
+
     if args.head_init_scale is not None:
         with torch.no_grad():
             model.get_classifier().weight.mul_(args.head_init_scale)
@@ -442,6 +543,7 @@ def main():
     if args.head_init_bias is not None:
         nn.init.constant_(model.get_classifier().bias, args.head_init_bias)
 
+   
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
@@ -505,13 +607,22 @@ def main():
             _logger.info(
                 f'Learning rate ({args.lr}) calculated from base learning rate ({args.lr_base}) '
                 f'and effective global batch size ({global_batch_size}) with {args.lr_base_scale} scaling.')
-
-    optimizer = create_optimizer_v2(
-        model,
-        **optimizer_kwargs(cfg=args),
-        **args.opt_kwargs,
-    )
-
+    if args.pretrained_finetune and args.pretrained:
+        print('using pretrained finetune, In addition to the head layer, the rest of the layers loaded with pre-training weights use a smaller learning rate, If lr_decay==0, freeze the pre-training layer')
+        optimizer = create_optimizer_v2(
+            model,
+            param_group_fn=param_group_fn_with_weight_decay,
+            **optimizer_kwargs(cfg=args),
+            **args.opt_kwargs,
+        )
+    else:
+        optimizer = create_optimizer_v2(
+            model,
+            param_group_fn=None,
+            # filter_bias_and_bn=False, # test
+            **optimizer_kwargs(cfg=args),
+            **args.opt_kwargs,
+        )
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
     loss_scaler = None
@@ -706,6 +817,16 @@ def main():
     best_epoch = None
     saver = None
     output_dir = None
+
+
+    if args.eval_checkpoint:  # evaluate the model
+        load_checkpoint(model, args.eval_checkpoint, args.model_ema, strict=True)
+        model.eval()
+        val_metrics = validate(model,loader_eval, validate_loss_fn, args)
+        print(f"Top-1 accuracy of the model is: {val_metrics['top1']:.2f}%")
+        return
+
+
     if utils.is_primary(args):
         if args.experiment:
             exp_name = args.experiment
@@ -797,7 +918,7 @@ def main():
                 args,
                 amp_autocast=amp_autocast,
             )
-
+            ema_eval_metrics = None
             if model_ema is not None and not args.model_ema_force_cpu:
                 if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                     utils.distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
@@ -810,7 +931,7 @@ def main():
                     amp_autocast=amp_autocast,
                     log_suffix=' (EMA)',
                 )
-                eval_metrics = ema_eval_metrics
+                # eval_metrics = ema_eval_metrics
 
             if output_dir is not None:
                 lrs = [param_group['lr'] for param_group in optimizer.param_groups]
@@ -818,6 +939,7 @@ def main():
                     epoch,
                     train_metrics,
                     eval_metrics,
+                    ema_eval_metrics,
                     filename=os.path.join(output_dir, 'summary.csv'),
                     lr=sum(lrs) / len(lrs),
                     write_header=best_metric is None,
