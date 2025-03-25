@@ -77,7 +77,7 @@ from .xcit import *
 
 from ._builder import build_model_with_cfg, load_pretrained, load_custom_pretrained, resolve_pretrained_cfg, \
     set_pretrained_download_progress, set_pretrained_check_hash
-from ._factory import create_model, parse_model_name, safe_model_name
+from ._factory import create_model, parse_model_name, safe_model_name, create_teacher_model
 from ._features import FeatureInfo, FeatureHooks, FeatureHookNet, FeatureListNet, FeatureDictNet
 from ._features_fx import FeatureGraphNet, GraphExtractNet, create_feature_extractor, \
     register_notrace_module, is_notrace_module, get_notrace_modules, \

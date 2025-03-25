@@ -14,4 +14,4 @@ from .radam import RAdam
 from .rmsprop_tf import RMSpropTF
 from .sgdp import SGDP
 from .lion import Lion
-from .optim_factory import create_optimizer, create_optimizer_v2, optimizer_kwargs
+from .optim_factory import create_optimizer, create_optimizer_v2, optimizer_kwargs, param_group_fn_with_weight_decay, param_group_fn_with_weight_decay_vq

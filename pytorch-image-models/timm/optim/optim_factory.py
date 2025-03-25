@@ -49,8 +49,8 @@ def param_groups_weight_decay(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-
-        if param.ndim <= 1 or name.endswith(".bias") or name in no_weight_decay_list:
+            # 修改 测试embedding的weightdecay设置为0
+        if param.ndim <= 1 or name.endswith(".bias") or name in no_weight_decay_list or'embedding' in name:
             no_decay.append(param)
         else:
             decay.append(param)
@@ -165,6 +165,8 @@ def optimizer_kwargs(cfg):
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
         momentum=cfg.momentum,
+        lr_decay=cfg.lr_decay
+
     )
     if getattr(cfg, 'opt_eps', None) is not None:
         kwargs['eps'] = cfg.opt_eps
@@ -189,11 +191,138 @@ def create_optimizer(args, model, filter_bias_and_bn=True):
         filter_bias_and_bn=filter_bias_and_bn,
     )
 
+def param_group_fn_with_weight_decay(
+        model: nn.Module,
+        base_lr: float,
+        filter_bias_and_bn,
+        weight_decay: float = 1e-5,
+        no_weight_decay_list=(),
+        lr_decay: float = 0.01
+):
+    """
+    CCZ0219
+    合并学习率和权重衰减的设置。
+    通过名称或指定层来设置不同的学习率和权重衰减。
+    
+    :param model: PyTorch模型
+    :param base_lr: 基础学习率
+    :param weight_decay: 权重衰减值
+    :param no_weight_decay_list: 不使用权重衰减的参数列表
+    :return: 分组后的参数和其对应的学习率和权重衰减
+    """
+    print('lr_decay for transfer learning: ', lr_decay)
+    if lr_decay==0:
+        for name, param in model.named_parameters():
+            if 'head' not in name:
+                param.requires_grad = False
+    if weight_decay and filter_bias_and_bn:
+        no_weight_decay_list = set(no_weight_decay_list)
+        decay = []
+        no_decay = []
+        param_groups = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
 
+            # 设置学习率
+            lr = base_lr * lr_decay if 'head' not in name else base_lr
+
+            # 设置是否使用权重衰减
+            if param.ndim <= 1 or name.endswith(".bias") or name in no_weight_decay_list:
+                no_decay.append({
+                    'params': param,
+                    'lr': lr,
+                    'weight_decay': 0.0  # 不应用权重衰减
+                })
+            else:
+                decay.append({
+                    'params': param,
+                    'lr': lr,
+                    'weight_decay': weight_decay  # 应用指定的权重衰减
+                })
+        # 返回包含权重衰减和学习率的两个分组
+        return no_decay + decay
+    else:
+        param_groups = []
+        for name, param in model.named_parameters():
+            # 设置默认学习率（0.001倍的正常学习率
+            if not param.requires_grad:
+                continue
+            lr = lr * lr_decay if 'head' not in name else lr
+            
+            # 根据参数名称添加到参数组
+            param_groups.append({
+                'params': param,
+                'lr': lr,
+            })
+        return param_groups
+def param_group_fn_with_weight_decay_vq(
+        model: nn.Module,
+        base_lr: float,
+        filter_bias_and_bn,
+        weight_decay: float = 1e-5,
+        no_weight_decay_list=(),
+        lr_decay: float = 0.01
+):
+    """
+    for vq
+    :param model: PyTorch模型
+    :param base_lr: 基础学习率
+    :param weight_decay: 权重衰减值
+    :param no_weight_decay_list: 不使用权重衰减的参数列表
+    :return: 分组后的参数和其对应的学习率和权重衰减
+    """
+    print('lr_decay for transfer learning: ', lr_decay)
+    if lr_decay==0:
+        for name, param in model.named_parameters():
+            if 'vq' not in name:
+                param.requires_grad = False
+    if weight_decay and filter_bias_and_bn:
+        no_weight_decay_list = set(no_weight_decay_list)
+        decay = []
+        no_decay = []
+        param_groups = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # 设置学习率
+            lr = base_lr * lr_decay if 'vq' not in name else base_lr
+
+            # 设置是否使用权重衰减
+            if param.ndim <= 1 or name.endswith(".bias") or name in no_weight_decay_list or 'embedding' in name: 
+                no_decay.append({
+                    'params': param,
+                    'lr': lr,
+                    'weight_decay': 0.0  # 不应用权重衰减
+                })
+            else:
+                decay.append({
+                    'params': param,
+                    'lr': lr,
+                    'weight_decay': weight_decay  # 应用指定的权重衰减
+                })
+        # 返回包含权重衰减和学习率的两个分组
+        return no_decay + decay
+    else:
+        param_groups = []
+        for name, param in model.named_parameters():
+            # 设置默认学习率（0.001倍的正常学习率
+            if not param.requires_grad:
+                continue
+            lr = lr * lr_decay if 'head' not in name else lr
+            
+            # 根据参数名称添加到参数组
+            param_groups.append({
+                'params': param,
+                'lr': lr,
+            })
+        return param_groups
 def create_optimizer_v2(
         model_or_params,
         opt: str = 'sgd',
         lr: Optional[float] = None,
+        lr_decay: Optional[float] = None,
         weight_decay: float = 0.,
         momentum: float = 0.9,
         foreach: Optional[bool] = None,
@@ -229,13 +358,14 @@ def create_optimizer_v2(
             no_weight_decay = model_or_params.no_weight_decay()
 
         if param_group_fn:
-            parameters = param_group_fn(model_or_params)
+            parameters = param_group_fn(model_or_params,lr,filter_bias_and_bn, weight_decay, no_weight_decay, lr_decay)
         elif layer_decay is not None:
             parameters = param_groups_layer_decay(
                 model_or_params,
                 weight_decay=weight_decay,
                 layer_decay=layer_decay,
                 no_weight_decay_list=no_weight_decay,
+
             )
             weight_decay = 0.
         elif weight_decay and filter_bias_and_bn:

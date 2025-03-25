@@ -44,6 +44,7 @@ def create_model(
         scriptable: Optional[bool] = None,
         exportable: Optional[bool] = None,
         no_jit: Optional[bool] = None,
+        strict: bool = True,
         **kwargs,
 ):
     """Create a model.
@@ -119,6 +120,52 @@ def create_model(
         )
 
     if checkpoint_path:
+        load_checkpoint(model, checkpoint_path, strict=strict)
+
+    return model
+
+
+def create_teacher_model(
+        model_name: str,
+        pretrained: bool = False,
+        pretrained_cfg: Optional[Union[str, Dict[str, Any], PretrainedCfg]] = None,
+        pretrained_cfg_overlay:  Optional[Dict[str, Any]] = None,
+        checkpoint_path: str = '',
+        scriptable: Optional[bool] = None,
+        exportable: Optional[bool] = None,
+        no_jit: Optional[bool] = None,
+        **kwargs,
+):
+    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+    model_source, model_name = parse_model_name(model_name)
+    if model_source == 'hf-hub':
+        assert not pretrained_cfg, 'pretrained_cfg should not be set when sourcing model from Hugging Face Hub.'
+        # For model names specified in the form `hf-hub:path/architecture_name@revision`,
+        # load model weights + pretrained_cfg from Hugging Face hub.
+        pretrained_cfg, model_name = load_model_config_from_hf(model_name)
+    else:
+        model_name, pretrained_tag = split_model_name_tag(model_name)
+        if pretrained_tag and not pretrained_cfg:
+            # a valid pretrained_cfg argument takes priority over tag in model name
+            pretrained_cfg = pretrained_tag
+
+    if not is_model(model_name):
+        raise RuntimeError('Unknown model (%s)' % model_name)
+
+    create_fn = model_entrypoint(model_name)
+    with set_layer_config(scriptable=scriptable, exportable=exportable, no_jit=no_jit):
+        model = create_fn(
+            pretrained=pretrained,
+            pretrained_cfg=pretrained_cfg,
+            pretrained_cfg_overlay=pretrained_cfg_overlay,
+            **kwargs,
+        )
+
+    if checkpoint_path:
         load_checkpoint(model, checkpoint_path)
+    
+    for p in model.parameters():
+        p.requires_grad = False
 
     return model

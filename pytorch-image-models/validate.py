@@ -17,7 +17,7 @@ import time
 from collections import OrderedDict
 from contextlib import suppress
 from functools import partial
-
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -27,6 +27,7 @@ from timm.layers import apply_test_time_pool, set_fast_norm
 from timm.models import create_model, load_checkpoint, is_model, list_models
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
     decay_batch_step, check_batch_size_retry, ParseKwargs, reparameterize_model
+from timm.data.constants import CIFAR10_MEAN, CIFAR10_STD, CIFAR100_TRAIN_MEAN, CIFAR100_TRAIN_STD, TINY_IMAGENET_MEAN, TINY_IMAGENET_STD,IMAGENET_DEFAULT_MEAN,IMAGENET_DEFAULT_STD
 
 try:
     from apex import amp
@@ -73,11 +74,11 @@ parser.add_argument('--img-size', default=None, type=int,
                     metavar='N', help='Input image dimension, uses model default if empty')
 parser.add_argument('--in-chans', type=int, default=None, metavar='N',
                     help='Image input channels (default: None => 3)')
-parser.add_argument('--input-size', default=None, nargs=3, type=int,
+parser.add_argument('--input-size', default=[3, 224, 224], nargs=3, type=int,
                     metavar='N N N', help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
 parser.add_argument('--use-train-size', action='store_true', default=False,
                     help='force use of train input size, even when test size is specified in pretrained cfg')
-parser.add_argument('--crop-pct', default=None, type=float,
+parser.add_argument('--crop-pct', default=0.875, type=float,
                     metavar='N', help='Input image center crop pct')
 parser.add_argument('--crop-mode', default=None, type=str,
                     metavar='N', help='Input image crop mode (squash, border, center). Model default if None.')
@@ -149,6 +150,11 @@ parser.add_argument('--valid-labels', default='', type=str, metavar='FILENAME',
 parser.add_argument('--retry', default=False, action='store_true',
                     help='Enable batch size decay & retry for single model validation')
 
+# for vqvit pre_calculate
+parser.add_argument('--pre-calculate', action='store_true', default=False,
+                    help='vqvit pre calculate .')
+
+
 
 def validate(args):
     # might as well try to validate something
@@ -209,18 +215,22 @@ def validate(args):
     if args.checkpoint:
         load_checkpoint(model, args.checkpoint, args.use_ema)
 
+    if args.pre_calculate:
+        model.pre_calculate()
+
     if args.reparam:
         model = reparameterize_model(model)
 
     param_count = sum([m.numel() for m in model.parameters()])
-    _logger.info('Model %s created, param count: %d' % (args.model, param_count))
-
+    # _logger.info('Model %s created, param count: %d' % (args.model, param_count))
+    
     data_config = resolve_data_config(
         vars(args),
         model=model,
         use_test_size=not args.use_train_size,
         verbose=True,
     )
+    
     test_time_pool = False
     if args.test_pool:
         model, test_time_pool = apply_test_time_pool(model, data_config)
@@ -311,7 +321,8 @@ def validate(args):
             # compute output
             with amp_autocast():
                 output = model(input)
-
+                if isinstance(output, tuple):
+                    output = output[0]
                 if valid_labels is not None:
                     output = output[:, valid_labels]
                 loss = criterion(output, target)
@@ -351,18 +362,32 @@ def validate(args):
         top1a, top5a = real_labels.get_accuracy(k=1), real_labels.get_accuracy(k=5)
     else:
         top1a, top5a = top1.avg, top5.avg
+    from thop import profile, clever_format
+    
+    model.eval()
+    input=torch.randn(1,data_config['input_size'][0],data_config['input_size'][1],data_config['input_size'][2]).cuda()
+    output=model(input)
+    if isinstance(output, tuple):
+        output = output[0]
+    flops, params = profile(model, inputs=(input,))
+    flops, params = clever_format([flops, params], "%.3f")
     results = OrderedDict(
+        dataset = args.dataset,
+        checkpoint = args.checkpoint,
         model=args.model,
-        top1=round(top1a, 4), top1_err=round(100 - top1a, 4),
-        top5=round(top5a, 4), top5_err=round(100 - top5a, 4),
+        top1=round(top1a, 4), # top1_err=round(100 - top1a, 4),
+        # top5=round(top5a, 4), #top5_err=round(100 - top5a, 4),
         param_count=round(param_count / 1e6, 2),
-        img_size=data_config['input_size'][-1],
+        FLOPs=flops,
+        img_size=data_config['input_size'],
         crop_pct=crop_pct,
         interpolation=data_config['interpolation'],
+        # params_thop=params,
+        
     )
 
-    _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
-       results['top1'], results['top1_err'], results['top5'], results['top5_err']))
+    # _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
+    #    results['top1'], results['top1_err'], results['top5'], results['top5_err']))
 
     return results
 
@@ -396,6 +421,32 @@ _NON_IN1K_FILTERS = ['*_in21k', '*_in22k', '*in12k', '*_dino', '*fcmae', '*seer'
 def main():
     setup_default_logging()
     args = parser.parse_args()
+
+    if 'cifar100' in args.dataset:
+        args.data_dir = '../../pytorch-cifar100-master/data/'
+        args.mean = CIFAR100_TRAIN_MEAN
+        args.std = CIFAR100_TRAIN_STD
+        args.num_classes = 100
+    elif 'cifar10' in args.dataset:
+        args.data_dir = '/home/mulan/ccz/pytorch-cifar100-master/data/cifar10download/'
+        args.mean = CIFAR10_MEAN
+        args.std = CIFAR10_STD
+        args.num_classes = 10
+    elif 'tiny-imagenet' in args.dataset or args.dataset=='ti':
+        args.data_dir = '/home/mulan/ccz/tiny-imagenet-200'
+        args.mean = IMAGENET_DEFAULT_MEAN
+        args.std = IMAGENET_DEFAULT_STD
+        args.num_classes = 200
+    elif 'imagenet1k' in args.dataset or args.dataset=='in':
+        args.data_dir = '/home/mulan/ccz/ImageNet2012'
+        args.mean = IMAGENET_DEFAULT_MEAN
+        args.std = IMAGENET_DEFAULT_STD
+        args.num_classes = 1000
+    else:
+        raise NotImplementedError(f'Unknown dataset {args.dataset}')
+    _logger.info(
+            f'Data: {args.dataset}, num classes: {args.num_classes}')
+
     model_cfgs = []
     model_names = []
     if os.path.isdir(args.checkpoint):

@@ -1,4 +1,7 @@
 """ Setup
+cd pytorch-image-models
+pip install -e . --user -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
+
 """
 from setuptools import setup, find_packages
 from codecs import open
