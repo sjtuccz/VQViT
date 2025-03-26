@@ -50,7 +50,7 @@ def param_groups_weight_decay(
         if not param.requires_grad:
             continue
             # 修改 测试embedding的weightdecay设置为0
-        if param.ndim <= 1 or name.endswith(".bias") or name in no_weight_decay_list or'embedding' in name:
+        if param.ndim <= 1 or name.endswith(".bias") or name in no_weight_decay_list or 'embedding' in name:
             no_decay.append(param)
         else:
             decay.append(param)
