@@ -234,7 +234,7 @@ class vqBlock(nn.Module):
             embedding_index =  self.vq(x)
             z_q = self.pre_cal_dict(embedding_index)
             z_q = z_q.view(input.shape)
-            return z_q+input
+            return z_q+input, embedding_index
         else:
             x, loss_dict = self.vq(x)
             # feat = x
@@ -793,10 +793,14 @@ class vqVisionTransformer(nn.Module):
         #     x = checkpoint_seq(self.blocks, x)
         # else:
         loss_dict = list()
+        index_record = list()
         for i in range(len(self.blocks)):
             x = self.blocks[i](x)
             if isinstance(x, tuple) and len(x) > 1:
-                loss_dict.append(x[1])
+                if not self.training and self.is_pre_cal:
+                    index_record.append(x[1])
+                else:
+                    loss_dict.append(x[1])
                 if is_feat:
                     feat.append(x[2])
                 x= x[0]
@@ -804,10 +808,12 @@ class vqVisionTransformer(nn.Module):
                 x= x[0]
         x = self.norm(x)
         x = self.forward_head(x)
-        if is_feat:
+        if is_feat and loss_dict:
             return x, torch.stack(loss_dict).sum(), feat
         elif loss_dict:
             return x, torch.stack(loss_dict).sum()
+        elif index_record:
+            return x, index_record
         else:
             return x
 

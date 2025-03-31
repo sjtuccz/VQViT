@@ -321,7 +321,7 @@ def validate(args):
             # compute output
             with amp_autocast():
                 output = model(input)
-                if isinstance(output, tuple):
+                if isinstance(output, (tuple,list)):
                     output = output[0]
                 if valid_labels is not None:
                     output = output[:, valid_labels]
@@ -423,22 +423,26 @@ def main():
     args = parser.parse_args()
 
     if 'cifar100' in args.dataset:
-        args.data_dir = '../../pytorch-cifar100-master/data/'
+        # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/'
+        args.data_dir = '../../pytorch-cifar100-master/data/' if not args.data_dir else args.data_dir
         args.mean = CIFAR100_TRAIN_MEAN
         args.std = CIFAR100_TRAIN_STD
         args.num_classes = 100
     elif 'cifar10' in args.dataset:
-        args.data_dir = '/home/mulan/ccz/pytorch-cifar100-master/data/cifar10download/'
+        # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/cifar10download/'
+        args.data_dir = '../../pytorch-cifar100-master/data/cifar10download/' if not args.data_dir else args.data_dir
         args.mean = CIFAR10_MEAN
         args.std = CIFAR10_STD
         args.num_classes = 10
-    elif 'tiny-imagenet' in args.dataset or args.dataset=='ti':
-        args.data_dir = '/home/mulan/ccz/tiny-imagenet-200'
-        args.mean = IMAGENET_DEFAULT_MEAN
-        args.std = IMAGENET_DEFAULT_STD
+    elif 'tiny-imagenet' in args.dataset:
+        args.data_dir = '../../tiny-imagenet-200/' if not args.data_dir else args.data_dir
+        # args.data_dir = '/mnt/ccz/tiny-imagenet-200/'
+        args.mean = IMAGENET_DEFAULT_MEAN #TINY_IMAGENET_MEAN
+        args.std = IMAGENET_DEFAULT_STD #TINY_IMAGENET_STD
         args.num_classes = 200
-    elif 'imagenet1k' in args.dataset or args.dataset=='in':
-        args.data_dir = '/home/mulan/ccz/ImageNet2012'
+    elif 'imagenet1k' in args.dataset:
+        # args.data_dir = '/mnt/ccz/ImageNet2012/'
+        args.data_dir = '../../ImageNet2012/' if not args.data_dir else args.data_dir
         args.mean = IMAGENET_DEFAULT_MEAN
         args.std = IMAGENET_DEFAULT_STD
         args.num_classes = 1000
