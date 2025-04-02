@@ -36,19 +36,62 @@ __all__ = ['vqVisionTransformer']  # model_registry will add each entrypoint fn 
 
 _logger = logging.getLogger(__name__)
 import random
+################# replace STE with rotation trick  
+
+from einops import rearrange, repeat, reduce, pack, unpack
+def exists(val):
+    return val is not None
+def default(val, d):
+    return val if exists(val) else d
+def pack_one(t, pattern):
+    packed, ps = pack([t], pattern)
+
+    def unpack_one(to_unpack, unpack_pattern = None):
+        unpacked, = unpack(to_unpack, ps, default(unpack_pattern, pattern))
+        return unpacked
+
+    return packed, unpack_one
+def l2norm(t, dim = -1,  eps = 1e-6):
+    return F.normalize(t, p = 2, dim = dim, eps = eps)
+def efficient_rotation_trick_transform(u, q, e):
+    """
+    4.2 in https://arxiv.org/abs/2410.06424
+    """
+    e = rearrange(e, 'b d -> b 1 d')
+    w = l2norm(u + q, dim = 1).detach()
+
+    return (
+        e -
+        2 * (e @ rearrange(w, 'b d -> b d 1') @ rearrange(w, 'b d -> b 1 d')) +
+        2 * (e @ rearrange(u, 'b d -> b d 1').detach() @ rearrange(q, 'b d -> b 1 d').detach())
+    )
+def safe_div(num, den, eps = 1e-6):
+    return num / den.clamp(min = eps)
+def rotate_to(src, tgt):
+    # rotation trick STE (https://arxiv.org/abs/2410.06424) to get gradients through VQ layer.
+    src, inverse = pack_one(src, '* d')
+    tgt, _ = pack_one(tgt, '* d')
+
+    norm_src = src.norm(dim = -1, keepdim = True)
+    norm_tgt = tgt.norm(dim = -1, keepdim = True)
+
+    rotated_tgt = efficient_rotation_trick_transform(
+        safe_div(src, norm_src),
+        safe_div(tgt, norm_tgt),
+        src
+    ).squeeze()
+
+    rotated = rotated_tgt * safe_div(norm_tgt, norm_src).detach()
+
+    return inverse(rotated)
+
+
+
+
 class VectorQuantizer(nn.Module):
     def __init__(self, n_e, channels_in, channels_dim, index=0):
         super().__init__()
         self.embedding = nn.Embedding(n_e, channels_dim)
-        # self.embedding.weight.data.uniform_(-1.0 / 1024, 1.0 / 1024)  #8096   -1.0 / n_e, 1.0 / n_e
-        # if index==8:
-        #     print('using index==8 init embedding')
-        #     trunc_normal_(self.embedding.weight,mean=0.0, std=5.0, a=-3.0, b=3.0)
-        # elif index==10:
-        #     print('using index==10 init embedding')
-        #     trunc_normal_(self.embedding.weight,mean=0.0, std=3.0, a=-4.0, b=4.0)
-        # else:
-            # trunc_normal_(self.embedding.weight,mean=0.0, std=1.0, a=-3.0, b=3.0)
         trunc_normal_(self.embedding.weight,mean=0.0, std=1.0, a=-3.0, b=3.0)
         self.compress = nn.Linear(channels_in, channels_dim)
         self.expand = nn.Linear(channels_dim, channels_in)

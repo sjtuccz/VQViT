@@ -34,6 +34,13 @@ def safe_model_name(model_name: str, remove_source: bool = True):
         model_name = parse_model_name(model_name)[-1]
     return make_safe(model_name)
 
+def load_state_dict_ignore_shape(state_dict, model):
+    model_dict = model.state_dict()
+    matched_dict = {
+        k: v for k, v in state_dict.items() 
+        if k in model_dict and v.shape == model_dict[k].shape
+    }
+    return matched_dict
 
 def create_model(
         model_name: str,
@@ -45,6 +52,7 @@ def create_model(
         exportable: Optional[bool] = None,
         no_jit: Optional[bool] = None,
         strict: bool = True,
+        is_filte_statedict: bool = False,
         **kwargs,
 ):
     """Create a model.
@@ -119,8 +127,10 @@ def create_model(
             **kwargs,
         )
 
+    state_dict_filter_fn = load_state_dict_ignore_shape if is_filte_statedict else None 
+    strict = False if is_filte_statedict else strict
     if checkpoint_path:
-        load_checkpoint(model, checkpoint_path, strict=strict)
+        load_checkpoint(model, checkpoint_path, strict=strict, filter_fn=state_dict_filter_fn)
 
     return model
 
