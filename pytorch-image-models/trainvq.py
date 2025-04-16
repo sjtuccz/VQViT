@@ -17,7 +17,7 @@ Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 import argparse
 import logging
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com" # for downloading dataset or weight huggingface hub
 
 import time
 from collections import OrderedDict
@@ -40,10 +40,9 @@ from timm.optim import create_optimizer_v2, optimizer_kwargs, param_group_fn_wit
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
 from timm.data.constants import CIFAR10_MEAN, CIFAR10_STD, CIFAR100_TRAIN_MEAN, CIFAR100_TRAIN_STD, TINY_IMAGENET_MEAN, TINY_IMAGENET_STD,IMAGENET_DEFAULT_MEAN,IMAGENET_DEFAULT_STD
-# CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
-# CIFAR10_STD = (0.2471, 0.2435, 0.2616)
-# CIFAR100_TRAIN_MEAN = [0.5071, 0.4867, 0.4408]#(0.5070751592371323, 0.48654887331495095, 0.4409178433670343)
-# CIFAR100_TRAIN_STD =  [0.2675, 0.2565, 0.2761]#(0.2673342858792401, 0.2564384629170883, 0.27615047132568404)
+
+from distill import *
+
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -107,6 +106,12 @@ group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
 group = parser.add_argument_group('Model parameters')
 group.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
                    help='Name of model to train (default: "resnet50")')
+group.add_argument('--kmeans-init-code', action='store_true', default=False,
+                   help='vit feature kmeans init codebook. (default: False)')
+group.add_argument('--freeze-wo-vq', action='store_true', default=False,
+                   help=' freeze all except vq block. (default: False)')
+group.add_argument('--shared-codebook', action='store_true', default=False,
+                   help=' share the codebook across all VQBlock. (default: False)')
 parser.add_argument('--dict-num', default=256, type=int, metavar='vqvit_dict',
                     help='vqvit dict size')
 parser.add_argument('--dict-dim', default=2, type=int, metavar='vqvit_dict_dim',
@@ -194,11 +199,15 @@ group.add_argument('--opt-kwargs', nargs='*', default={}, action=utils.ParseKwar
 # loss
 parser.add_argument('--T', type=float, default=1.0,
                     help='knowledge distillation loss temperature')
+parser.add_argument('--top-k', type=int, default=None,
+                    help='top k for distillation cos sim loss')
 parser.add_argument('--dictloss-weight', type=float, default=1.0, help='dic loss weight')
-parser.add_argument('--loss-weight', type=float, default=1.0, help='loss weight')
+parser.add_argument('--celoss-weight', type=float, default=1.0, help='loss weight')
 parser.add_argument('--klloss-weight', type=float, default=1.0, help='kl loss weight')
 parser.add_argument('--FLfn', default='L2', type=str, metavar='FLossFunc',
                     help='type of feature loss func (default: L2) One of ("L2", "KL", "")')
+parser.add_argument('--Disfn', default='KL', type=str, metavar='DIStillLossFunc',
+                    help='type of distillation loss func (default: KlDiv) One of ("CE", "KL", "")')
 parser.add_argument('--featureloss-weight', type=float, default=2.0, help='feature loss weight')
 parser.add_argument('--featureloss-reduction', default='mean', type=str, metavar='POOL',
                     help='sum or mean reduction for feature loss (default: sum)')
@@ -403,68 +412,19 @@ def _parse_args():
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
-import torch.nn.functional as F
-class DistillKL(nn.Module):
-    """Distilling the Knowledge in a Neural Network"""
-    def __init__(self, T,dim=1):
-        super(DistillKL, self).__init__()
-        self.T = T
-        self.dim=dim
 
-    def forward(self, y_s, y_t):
-        p_s = F.log_softmax(y_s/self.T, dim=self.dim)
-        p_t = F.softmax(y_t/self.T, dim=self.dim)
-        loss = F.kl_div(p_s, p_t, reduction='sum') * (self.T**2) / y_s.shape[0]
-        return loss
-    
-class FeatureLossL2(nn.Module):
-    def __init__(self, reduction='sum'):
-        super(FeatureLossL2, self).__init__()
-        self.reduction = reduction  # 选择损失的计算方式
-
-#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    def forward(self, fstudent, fteacher):
-        # fstudent = fstudent[1:-4]
-        # fteacher = fteacher[1:-4]
-        loss_all = 0.0
-        index=0
-        for fs, ft in zip(fstudent, fteacher):
-            loss = F.mse_loss(fs, ft, reduction='mean')
-            # print(f'index: {index}, loss: {loss}')
-            # index+=1
-            loss_all += loss
-        if self.reduction == 'mean':
-            return loss_all / len(fstudent)  # 返回均值
-        elif self.reduction == 'sum':
-            return loss_all  # 返回总和
-        else:
-            raise ValueError("Invalid reduction type. Use 'mean' or 'sum'.")
-
-class FeatureLossKL(nn.Module):
-    def __init__(self, reduction='mean'):
-        super(FeatureLossKL, self).__init__()
-        self.reduction = reduction  # 选择损失的计算方式
-        self.kl = DistillKL(T=1,dim=-1)
-
-#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    def forward(self, fstudent, fteacher):
-        # fstudent = fstudent[-5:]
-        # fteacher = fteacher[-5:]
-        loss_all = 0.0
-        for fs, ft in zip(fstudent, fteacher):
-            loss = self.kl(fs, ft)
-            loss_all += loss
-        if self.reduction == 'mean':
-            return loss_all / len(fstudent)  # 返回均值
-        elif self.reduction == 'sum':
-            return loss_all  # 返回总和
-        else:
-            raise ValueError("Invalid reduction type. Use 'mean' or 'sum'.")
-
+from kmeans_init_codebook import kmeans_pca_fit_dim
+def init_codebook(model, feat_list):
+    '''使用kmeans聚类token进行codebook的初始化，如果token和codebook的维度不同，则使用PCA降维'''
+    print('===============================================================init codebook using kmeans vit features')
+    for block, feat in zip(model.blocks, feat_list):
+        device = block.vq.embedding.weight.device
+        centroids, counts = kmeans_pca_fit_dim(feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+        block.vq.embedding.weight.data = centroids.to(device)
 def main():
     utils.setup_default_logging()
     args, args_text = _parse_args()
-
+    print('args.batch_size:  ',args.batch_size)
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
@@ -532,6 +492,11 @@ def main():
         args.mean = IMAGENET_DEFAULT_MEAN
         args.std = IMAGENET_DEFAULT_STD
         args.num_classes = 1000
+    elif 'imagenet100' in args.dataset:
+        args.data_dir = '../../imagenet100/' if not args.data_dir else args.data_dir
+        args.mean = IMAGENET_DEFAULT_MEAN
+        args.std = IMAGENET_DEFAULT_STD
+        args.num_classes = 100
     else:
         raise NotImplementedError(f'Unknown dataset {args.dataset}')
     _logger.info(
@@ -554,6 +519,26 @@ def main():
         dic_n=args.dict_num, dic_dim=args.dict_dim,
         **args.model_kwargs,
     )
+    if args.shared_codebook:
+        model.use_shared_codebook()
+
+    # def freeze_attn_layers_but_keep_grad(model):
+    #     print("freeze MHA")
+    #     for name, param in model.named_parameters():
+    #         if 'attn' in name:
+    #             param.requires_grad = False 
+    # freeze_attn_layers_but_keep_grad(model)
+
+    def freeze_but_keep_VQ_grad(model):
+        print("freeze VQ Block")
+        for name, param in model.named_parameters():
+            if 'vq' in name or 'head' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False 
+    if args.freeze_wo_vq:
+        print('freezing all except vq')
+        freeze_but_keep_VQ_grad(model)
 
     init_teacher_checkpoint = args.teacher_checkpoint or args.initial_checkpoint
     teacher_model = create_teacher_model(
@@ -842,12 +827,21 @@ def main():
         train_loss_fn = nn.CrossEntropyLoss()
     train_loss_fn = train_loss_fn.to(device=device)
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
-    kl_criterion =  DistillKL(args.T).to(device=device)
+    if args.Disfn=='CE':
+        kl_criterion =  DistillCE().to(device=device)
+    elif args.Disfn=='cos':
+        kl_criterion =  DistillCosSim(args.top_k).to(device=device)
+    else:   
+        kl_criterion =  DistillKL(args.T).to(device=device)
     if args.FLfn=='KL':
         print('using KL loss for feature loss calculation')
         feature_criterion =  FeatureLossKL(reduction=args.featureloss_reduction).to(device=device)
+    elif args.FLfn=='cos':
+        print('using cos loss for feature loss calculation')
+        feature_criterion =  FeatureLossCosine(reduction=args.featureloss_reduction).to(device=device)
     else:
         feature_criterion =  FeatureLossL2(reduction=args.featureloss_reduction).to(device=device)
+        
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
@@ -1069,7 +1063,7 @@ def train_one_epoch(
             with amp_autocast():
                 teacher_output, teacher_feat = teacher_model(input,is_feat=True)
                 output, dict_loss, feat = model(input,is_feat=True)
-                loss = loss_fn(output, target)
+                loss = loss_fn(output, target) * args.celoss_weight
                 loss_dict = dict_loss * args.dictloss_weight
                 loss_kl =  kl_criterion(output, teacher_output.detach()) * args.klloss_weight
                 loss_feature = feature_criterion(feat,teacher_feat) *args.featureloss_weight
@@ -1105,9 +1099,15 @@ def train_one_epoch(
 
         if has_no_sync and not need_update:
             with model.no_sync():
+                if epoch==0 and batch_idx==0 and args.kmeans_init_code:
+                    teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
+                    init_codebook(model,init_feat_list)
                 loss = _forward()
                 _backward(loss)
         else:
+            if epoch==0 and batch_idx==0 and args.kmeans_init_code:
+                teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
+                init_codebook(model,init_feat_list)
             loss = _forward()
             # for name, param in model.named_parameters():
             #     if param.grad is None or not param.requires_grad:

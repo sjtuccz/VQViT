@@ -151,11 +151,34 @@ parser.add_argument('--retry', default=False, action='store_true',
                     help='Enable batch size decay & retry for single model validation')
 
 # for vqvit pre_calculate
-parser.add_argument('--pre-calculate', action='store_true', default=False,
+parser.add_argument('--repara', action='store_true', default=False,
                     help='vqvit pre calculate .')
 
 
-
+def fix_exact_params(params, model):
+    if not model.blocks[0].vq.embedding:
+        return params
+    embedding_para_list=[]
+    for block in model.blocks:
+        embedding_para_list.append(block.vq.embedding.weight.data)
+    stacked = torch.stack(embedding_para_list)  # 形状变为 (N, 1024, 8)
+    if (stacked == stacked[0]).all().item():
+        print('=========================all codebook are same, fixing exact params')
+        exact_params = params-stacked.numel()+embedding_para_list[0].numel()
+        return exact_params
+    else:
+        return params
+    # print(embedding_para_list[0].numel())
+    # print(stacked.numel())
+    # exact_params = params-stacked.numel()+embedding_para_list[0].numel()
+    # return exact_params
+def format_param_count(param_count, decimal_places=2):
+    if param_count >= 1e9:
+        return f"{round(param_count / 1e9, decimal_places)}B" 
+    elif param_count >= 1e6:
+        return f"{round(param_count / 1e6, decimal_places)}M"  
+    else:
+        return f"{round(param_count / 1e3, decimal_places)}K" 
 def validate(args):
     # might as well try to validate something
     args.pretrained = args.pretrained or not args.checkpoint
@@ -215,11 +238,16 @@ def validate(args):
     if args.checkpoint:
         load_checkpoint(model, args.checkpoint, args.use_ema)
 
-    if args.pre_calculate:
-        model.pre_calculate()
+    # if args.pre_calculate:
+        # model.pre_calculate()
 
     if args.reparam:
-        model = reparameterize_model(model)
+        # model = reparameterize_model(model)
+        model.reparameterize()
+        for name, param in model.named_parameters():
+            num_params = param.numel()
+            print(f"{name:35} | Shape: {str(list(param.shape)):20} | Params: {num_params:10,}")
+
 
     param_count = sum([m.numel() for m in model.parameters()])
     # _logger.info('Model %s created, param count: %d' % (args.model, param_count))
@@ -370,6 +398,9 @@ def validate(args):
     if isinstance(output, tuple):
         output = output[0]
     flops, params = profile(model, inputs=(input,))
+    # if 'vq' in args.model:
+    #     params = fix_exact_params(params, model)
+    #     param_count = fix_exact_params(param_count, model)
     flops, params = clever_format([flops, params], "%.3f")
     results = OrderedDict(
         dataset = args.dataset,
@@ -377,12 +408,14 @@ def validate(args):
         model=args.model,
         top1=round(top1a, 4), # top1_err=round(100 - top1a, 4),
         # top5=round(top5a, 4), #top5_err=round(100 - top5a, 4),
-        param_count=round(param_count / 1e6, 2),
+        # param_count=round(param_count, 2),
+        param_count=format_param_count(param_count),
         FLOPs=flops,
         img_size=data_config['input_size'],
         crop_pct=crop_pct,
         interpolation=data_config['interpolation'],
-        # params_thop=params,
+        params_thop=params,
+        average_batchtime = f'{batch_time.avg:.3f}s, {input.size(0) / batch_time.avg:>7.2f}/s'
         
     )
 
@@ -430,7 +463,7 @@ def main():
         args.num_classes = 100
     elif 'cifar10' in args.dataset:
         # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/cifar10download/'
-        args.data_dir = '../../pytorch-cifar100-master/data/cifar10download/' if not args.data_dir else args.data_dir
+        args.data_dir = '/home/mulan/ccz/pytorch-cifar100-master/data/cifar10download/' if not args.data_dir else args.data_dir
         args.mean = CIFAR10_MEAN
         args.std = CIFAR10_STD
         args.num_classes = 10
@@ -446,6 +479,11 @@ def main():
         args.mean = IMAGENET_DEFAULT_MEAN
         args.std = IMAGENET_DEFAULT_STD
         args.num_classes = 1000
+    elif 'imagenet100' in args.dataset:
+        args.data_dir = '../../imagenet100/' if not args.data_dir else args.data_dir
+        args.mean = IMAGENET_DEFAULT_MEAN
+        args.std = IMAGENET_DEFAULT_STD
+        args.num_classes = 100
     else:
         raise NotImplementedError(f'Unknown dataset {args.dataset}')
     _logger.info(

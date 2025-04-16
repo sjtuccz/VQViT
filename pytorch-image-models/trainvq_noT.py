@@ -107,9 +107,9 @@ group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
 group = parser.add_argument_group('Model parameters')
 group.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
                    help='Name of model to train (default: "resnet50")')
-parser.add_argument('--dict-num', default=2048, type=int, metavar='vqvit_dict',
+parser.add_argument('--dict-num', default=256, type=int, metavar='vqvit_dict',
                     help='vqvit dict size')
-parser.add_argument('--dict-dim', default=64, type=int, metavar='vqvit_dict_dim',
+parser.add_argument('--dict-dim', default=2, type=int, metavar='vqvit_dict_dim',
                     help='vqvit dict dim')
 
 group.add_argument('--pretrained', action='store_true', default=False,
@@ -495,6 +495,16 @@ def main():
         dic_n=args.dict_num, dic_dim=args.dict_dim,
         **args.model_kwargs,
     )
+    def freeze_attn_layers_but_keep_grad(model):
+        print("freeze MHA")
+        for name, param in model.named_parameters():
+            if 'attn' in name:
+                param.requires_grad = False 
+
+    freeze_attn_layers_but_keep_grad(model)
+
+
+
     if args.head_init_scale is not None:
         with torch.no_grad():
             model.get_classifier().weight.mul_(args.head_init_scale)
@@ -768,12 +778,6 @@ def main():
         train_loss_fn = nn.CrossEntropyLoss()
     train_loss_fn = train_loss_fn.to(device=device)
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
-    kl_criterion =  DistillKL(args.T).to(device=device)
-    if args.FLfn=='KL':
-        print('using KL loss for feature loss calculation')
-        feature_criterion =  FeatureLossKL(reduction=args.featureloss_reduction).to(device=device)
-    else:
-        feature_criterion =  FeatureLossL2(reduction=args.featureloss_reduction).to(device=device)
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric

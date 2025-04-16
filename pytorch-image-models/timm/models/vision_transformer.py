@@ -152,16 +152,22 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, is_feat=False, init_codebook_feat = False):
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
         input = x
+        init_feat = input
         x = self.norm2(x)
         x = self.mlp(x)
         feat = x
         x = self.ls2(x)
         x = self.drop_path2(x)
         x = x + input
-        return x, feat
+        if is_feat:
+            return x, feat
+        elif init_codebook_feat:
+            return x, init_feat
+        else:
+            return x
         # x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         # return x
 
@@ -689,8 +695,9 @@ class VisionTransformer(nn.Module):
         x = self.head_drop(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x, is_feat=False):
+    def forward(self, x, is_feat=False, init_codebook_feat = False):
         feat=list()
+        init_feat_list = list()
         # x = self.forward_features(x,is_feat)
         x = self.patch_embed(x)
         x = self._pos_embed(x)
@@ -700,9 +707,12 @@ class VisionTransformer(nn.Module):
         #     x = checkpoint_seq(self.blocks, x)
         # else:
         for i in range(len(self.blocks)):
-            x= self.blocks[i](x)
+            x= self.blocks[i](x, is_feat, init_codebook_feat)
             if is_feat and isinstance(x, tuple) and len(x) > 1:
                 feat.append(x[1])
+                x= x[0]
+            elif init_codebook_feat and isinstance(x, tuple) and len(x) > 1:
+                init_feat_list.append(x[1])
                 x= x[0]
             elif isinstance(x, tuple):
                 x= x[0]
@@ -710,6 +720,8 @@ class VisionTransformer(nn.Module):
         x = self.forward_head(x)
         if is_feat:
             return x, feat
+        elif init_codebook_feat:
+            return x, init_feat_list
         else:
             return x
 

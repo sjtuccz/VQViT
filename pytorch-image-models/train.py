@@ -453,6 +453,11 @@ def main():
         args.mean = IMAGENET_DEFAULT_MEAN
         args.std = IMAGENET_DEFAULT_STD
         args.num_classes = 1000
+    elif 'imagenet100' in args.dataset:
+        args.data_dir = '../../imagenet100/'
+        args.mean = IMAGENET_DEFAULT_MEAN
+        args.std = IMAGENET_DEFAULT_STD
+        args.num_classes = 100
     else:
         raise NotImplementedError(f'Unknown dataset {args.dataset}')
     _logger.info(
