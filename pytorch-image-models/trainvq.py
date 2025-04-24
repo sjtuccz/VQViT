@@ -42,7 +42,8 @@ from timm.utils import ApexScaler, NativeScaler
 from timm.data.constants import CIFAR10_MEAN, CIFAR10_STD, CIFAR100_TRAIN_MEAN, CIFAR100_TRAIN_STD, TINY_IMAGENET_MEAN, TINY_IMAGENET_STD,IMAGENET_DEFAULT_MEAN,IMAGENET_DEFAULT_STD
 
 from distill import *
-
+from sklearn.decomposition import PCA
+from einops import rearrange, repeat, reduce, pack, unpack
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -106,8 +107,16 @@ group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
 group = parser.add_argument_group('Model parameters')
 group.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
                    help='Name of model to train (default: "resnet50")')
+
+group.add_argument('--vqtype', default='vq', type=str, metavar='VQ',
+                   help='vqtype: vq or fsq')
+group.add_argument('--fsq-level', type=int, nargs='+', default=[7,7,7], metavar='FSQLEVEL',
+                   help='fsq level')
+
 group.add_argument('--kmeans-init-code', action='store_true', default=False,
                    help='vit feature kmeans init codebook. (default: False)')
+group.add_argument('--init-fsqt', action='store_true', default=False,
+                   help='vit feature init T of fsq if using fsq. (default: False)')
 group.add_argument('--freeze-wo-vq', action='store_true', default=False,
                    help=' freeze all except vq block. (default: False)')
 group.add_argument('--shared-codebook', action='store_true', default=False,
@@ -421,6 +430,43 @@ def init_codebook(model, feat_list):
         device = block.vq.embedding.weight.device
         centroids, counts = kmeans_pca_fit_dim(feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
         block.vq.embedding.weight.data = centroids.to(device)
+
+def init_fsqt(model, feat_list):
+    
+    print('===============================================================init T of fsq using vit features')
+    step = 0.1
+    t_range = (torch.arange(1, 51) * step).to(feat_list[0].device)  # 1→0.1, 2→0.2,..., 50→5.0
+    for block, feat in zip(model.blocks, feat_list):
+        fsq = block.vq
+        codebook_dim = block.vq.codebook_dim
+        max_value = feat.max()
+        min_value = feat.min()
+        mean = feat.mean()
+        std = feat.std()
+        input = mean + std * torch.randn(1, 100000, codebook_dim, device=feat.device)
+        input = torch.clamp(input, min=-min_value, max=max_value)
+        print(f'mean: {mean}, std: {std}, max_value: {max_value}, min_value: {min_value}')
+
+        # samples = rearrange(feat, 'b h d ->(b h) d') 
+        # x_np = samples.cpu().numpy()
+        # pca = PCA(n_components=codebook_dim)
+        # x_reduced = pca.fit_transform(x_np)
+        # input = torch.from_numpy(x_reduced)
+        # input = rearrange(input, '(b h) d -> b h d', b=feat.shape[0], h=feat.shape[1]).to(feat.device)
+
+        error_recoed = []
+        for i, t in enumerate(t_range):
+            fsq.T = t
+            output1 = fsq.quantize(input)
+            error = torch.abs(output1 - input).sum()
+            error_recoed.append(error)
+            print(f'i: {i}, error: {error}, t: {t}')
+        t_optimal = t_range[error_recoed.index(min(error_recoed))]
+        fsq.T = t_optimal
+        print(f't_optimal: {t_optimal}')
+
+        
+
 def main():
     utils.setup_default_logging()
     args, args_text = _parse_args()
@@ -517,6 +563,8 @@ def main():
         # strict=True,
         strict=False,
         dic_n=args.dict_num, dic_dim=args.dict_dim,
+        vq_type=args.vqtype,
+        fsq_level=args.fsq_level,
         **args.model_kwargs,
     )
     if args.shared_codebook:
@@ -1099,15 +1147,21 @@ def train_one_epoch(
 
         if has_no_sync and not need_update:
             with model.no_sync():
-                if epoch==0 and batch_idx==0 and args.kmeans_init_code:
+                if epoch==0 and batch_idx==0:
                     teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
-                    init_codebook(model,init_feat_list)
+                    if args.vqtype == 'vq' and args.kmeans_init_code:
+                        init_codebook(model,init_feat_list)
+                    elif args.vqtype == 'fsq' and args.init_fsqt:
+                        init_fsqt(model,init_feat_list)
                 loss = _forward()
                 _backward(loss)
         else:
-            if epoch==0 and batch_idx==0 and args.kmeans_init_code:
+            if epoch==0 and batch_idx==0:
                 teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
-                init_codebook(model,init_feat_list)
+                if args.vqtype == 'vq' and args.kmeans_init_code:
+                    init_codebook(model,init_feat_list)
+                elif args.vqtype == 'fsq' and args.init_fsqt:
+                    init_fsqt(model,init_feat_list)
             loss = _forward()
             # for name, param in model.named_parameters():
             #     if param.grad is None or not param.requires_grad:

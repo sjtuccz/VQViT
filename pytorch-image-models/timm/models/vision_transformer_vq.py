@@ -30,7 +30,7 @@ from ._builder import build_model_with_cfg
 from ._manipulate import named_apply, checkpoint_seq, adapt_input_conv
 from ._registry import generate_default_cfgs, register_model, register_model_deprecations
 
-from timm.models.vectorquantize import VectorQuantizer_LossMask, VectorQuantizer_noLinear, VectorQuantizer_CosSim, VectorQuantizer, VectorQuantizer_LinearRebuild, VectorQuantizer_Sim, TokenToImageToToken, FSQ
+from timm.models.vectorquantize import VectorQuantizer_LossMask, VectorQuantizer_noLinear, VectorQuantizer_CosSim, VectorQuantizer, VectorQuantizer_LinearRebuild, VectorQuantizer_Sim, TokenToImageToToken, FSQ, FSQ_T
 
 __all__ = ['vqVisionTransformer']  # model_registry will add each entrypoint fn to this
 
@@ -116,7 +116,9 @@ class vqBlock(nn.Module):
             norm_layer=nn.LayerNorm,
             mlp_layer=Mlp,
             dic_n=1024, dic_dim=8,
-            index=0
+            index=0,
+            vq_type='vq',
+            fsq_level = [7,7,7,7]
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -131,15 +133,25 @@ class vqBlock(nn.Module):
         )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        if vq_type == 'vq':
+            print(f'using vq, codebook: {dic_n, dic_dim}')
+            self.vq = VectorQuantizer(dic_n, dim, dic_dim, index)
         # self.vq = VectorQuantizer_LossMask(dic_n, dim, dic_dim, index)
         # self.vq = VectorQuantizer_noLinear(dic_n, dim, dic_dim, index)
         # self.vq = VectorQuantizer_CosSim(dic_n, dim, dic_dim, index)
         # self.vq = VectorQuantizer_LinearRebuild(dic_n, dim, dic_dim, index)
         # self.vq = VectorQuantizer_Sim(dic_n, dim, dic_dim, index)
-        # self.vq = FSQ(dic_n, dim, dic_dim, index, levels=[5,5,5,5])
+        elif vq_type == 'fsq':
+            print(f'using fsq, levels={fsq_level}')
+            # self.vq = FSQ(dic_n, dim, dic_dim, index, levels=fsq_level) #先确定在wd0.1的条件下是128更高 还是512b更高
+            self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=2)
+        # self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=[15,15,15], T=2)
+        # self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=[15,15,15], T=1)
         # self.vq = FSQ(dic_n, dim, dic_dim, index, levels=[17,17,17,17])
-        self.vq = FSQ(dic_n, dim, dic_dim, index, levels=[7,7,7,7])
-        # self.vq = VectorQuantizer(dic_n, dim, dic_dim, index)
+        # self.vq = FSQ(dic_n, dim, dic_dim, index, levels=[7,7,7,3,3,3])
+        # self.vq = FSQ(dic_n, dim, dic_dim, index, levels=[31,31])
+        # self.vq = FSQ(dic_n, dim, dic_dim, index, levels=[4,3,3,3,3,3,3,3])
+        
         self.norm2 = norm_layer(dim)
         self.mlp = mlp_layer(
             in_features=dim,
@@ -152,6 +164,45 @@ class vqBlock(nn.Module):
         self.is_pre_cal = False
         self.dict_n = dic_n
         self.dim = dim
+    # def reparameterize(self):
+    #     print('using Block reparameterize')
+    #     self.is_pre_cal = True
+    #     self.pre_cal_dict = nn.Embedding(self.vq.codebook_size, self.dim)
+    #     vq_dict = self.vq.reparameterize()
+    #     # x=self.norm2(vq_dict)
+    #     x=self.mlp(vq_dict)
+    #     x = self.ls2(x)
+    #     self.pre_cal_dict.weight.data.copy_(x)
+    #     del self.norm2
+    #     del self.mlp
+    #     del self.ls2
+    # def forward(self, x):
+    #     x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+    #     # start = time.perf_counter() 
+    #     input = x
+    #     # 调整vq和norm的顺序，norm->vq   ||   vq->norm
+    #     if not self.training and self.is_pre_cal:
+    #         x = self.norm2(x)
+    #         embedding_index =  self.vq(x)
+    #         z_q = self.pre_cal_dict(embedding_index)
+    #         z_q = z_q.view(input.shape)
+    #         # end = time.perf_counter()
+    #         # print(f"代码运行时间: {end - start:.6f} 秒")
+    #         return z_q+input, embedding_index
+    #     else:
+            
+    #         # feat = x
+    #         x = self.norm2(x)
+    #         x, loss_dict = self.vq(x)
+    #         # x, loss_dict = self.vq(x)
+    #         x = self.mlp(x)
+    #         feat = x
+    #         x = self.ls2(x)
+    #         x = self.drop_path2(x)
+    #         x = x + input
+    #         # end = time.perf_counter()
+    #         # print(f"代码运行时间: {end - start:.6f} 秒")
+    #         return x, loss_dict, feat
     def reparameterize(self):
         print('using Block reparameterize')
         self.is_pre_cal = True
@@ -165,32 +216,27 @@ class vqBlock(nn.Module):
         del self.mlp
         del self.ls2
     def forward(self, x):
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
-        # start = time.perf_counter() 
+        input0 = x
+        x = self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        # feat = x # 蒸馏位置1
+        x = input0 + x
         input = x
-        # 调整vq和norm的顺序，norm->vq   ||   vq->norm
         if not self.training and self.is_pre_cal:
             embedding_index =  self.vq(x)
             z_q = self.pre_cal_dict(embedding_index)
             z_q = z_q.view(input.shape)
-            # end = time.perf_counter()
-            # print(f"代码运行时间: {end - start:.6f} 秒")
             return z_q+input, embedding_index
         else:
+            # feat = x # 蒸馏位置2
             x, loss_dict = self.vq(x)
-            # feat = x
             x = self.norm2(x)
-            # x, loss_dict = self.vq(x)
             x = self.mlp(x)
-            feat = x
+            # feat = x # z蒸馏位置3
             x = self.ls2(x)
             x = self.drop_path2(x)
             x = x + input
-            # end = time.perf_counter()
-            # print(f"代码运行时间: {end - start:.6f} 秒")
+            feat = x # 蒸馏位置4
             return x, loss_dict, feat
-        # return x
-
 
 class vqVisionTransformer(nn.Module):
     """ Vision Transformer
@@ -233,7 +279,7 @@ class vqVisionTransformer(nn.Module):
             act_layer: Optional[LayerType] = None,
             block_fn: Type[nn.Module] = vqBlock,
             mlp_layer: Type[nn.Module] = Mlp,
-            dic_n=2048, dic_dim=64
+            dic_n=2048, dic_dim=64, vq_type='vq', fsq_level=[7,7,7,7]
     ):
         """
         Args:
@@ -325,7 +371,9 @@ class vqVisionTransformer(nn.Module):
                 act_layer=act_layer,
                 mlp_layer=mlp_layer,
                 dic_n=dic_n, dic_dim=dic_dim,
-                index=i
+                index=i,
+                vq_type=vq_type,
+                fsq_level = fsq_level
             )
             for i in range(depth)])
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()

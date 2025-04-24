@@ -451,28 +451,33 @@ def main():
 
     if 'cifar100' in args.dataset:
         # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/'
-        args.data_dir = '../../pytorch-cifar100-master/data/'
+        args.data_dir = '../../pytorch-cifar100-master/data/' if not args.data_dir else args.data_dir
         args.mean = CIFAR100_TRAIN_MEAN
         args.std = CIFAR100_TRAIN_STD
         args.num_classes = 100
     elif 'cifar10' in args.dataset:
         # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/cifar10download/'
-        args.data_dir = '../../pytorch-cifar100-master/data/cifar10download/'
+        args.data_dir = '../../pytorch-cifar100-master/data/cifar10download/' if not args.data_dir else args.data_dir
         args.mean = CIFAR10_MEAN
         args.std = CIFAR10_STD
         args.num_classes = 10
     elif 'tiny-imagenet' in args.dataset:
-        # args.data_dir = '../../tiny-imagenet-200/'
-        args.data_dir = '/mnt/ccz/tiny-imagenet-200/'
+        args.data_dir = '../../tiny-imagenet-200/' if not args.data_dir else args.data_dir
+        # args.data_dir = '/mnt/ccz/tiny-imagenet-200/'
         args.mean = IMAGENET_DEFAULT_MEAN #TINY_IMAGENET_MEAN
         args.std = IMAGENET_DEFAULT_STD #TINY_IMAGENET_STD
         args.num_classes = 200
     elif 'imagenet1k' in args.dataset:
-        args.data_dir = '/mnt/ccz/ImageNet2012/'
-        # args.data_dir = '../../ImageNet2012/'
+        # args.data_dir = '/mnt/ccz/ImageNet2012/'
+        args.data_dir = '../../ImageNet2012/' if not args.data_dir else args.data_dir
         args.mean = IMAGENET_DEFAULT_MEAN
         args.std = IMAGENET_DEFAULT_STD
         args.num_classes = 1000
+    elif 'imagenet100' in args.dataset:
+        args.data_dir = '../../imagenet100/' if not args.data_dir else args.data_dir
+        args.mean = IMAGENET_DEFAULT_MEAN
+        args.std = IMAGENET_DEFAULT_STD
+        args.num_classes = 100
     else:
         raise NotImplementedError(f'Unknown dataset {args.dataset}')
     _logger.info(

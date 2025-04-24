@@ -153,15 +153,20 @@ class Block(nn.Module):
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x, is_feat=False, init_codebook_feat = False):
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        input0 = x
+        x = self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        # feat = x # 蒸馏位置1
+        x = input0 + x
+        # feat = x # 蒸馏位置2
         input = x
         init_feat = input
         x = self.norm2(x)
         x = self.mlp(x)
-        feat = x
+        # feat = x  # 蒸馏位置3
         x = self.ls2(x)
         x = self.drop_path2(x)
         x = x + input
+        feat = x  # 蒸馏位置4
         if is_feat:
             return x, feat
         elif init_codebook_feat:
