@@ -334,6 +334,11 @@ group.add_argument('--drop-connect', type=float, default=None, metavar='PCT',
                    help='Drop connect rate, DEPRECATED, use drop-path (default: None)')
 group.add_argument('--drop-path', type=float, default=0.0, metavar='PCT',
                    help='Drop path rate (default: None)')
+group.add_argument('--attn-drop-rate', type=float, default=0.0, metavar='PCT',
+                   help='Attention Drop path rate (default: None)')
+# proj_drop_rate
+group.add_argument('--proj-drop-rate', type=float, default=0.0, metavar='PCT',
+                   help='Attention projection layer Drop path rate (default: None)')
 group.add_argument('--drop-block', type=float, default=None, metavar='PCT',
                    help='Drop block rate (default: None)')
 
@@ -426,33 +431,60 @@ from kmeans_init_codebook import kmeans_pca_fit_dim
 def init_codebook(model, feat_list):
     '''使用kmeans聚类token进行codebook的初始化，如果token和codebook的维度不同，则使用PCA降维'''
     print('===============================================================init codebook using kmeans vit features')
-    for block, feat in zip(model.blocks, feat_list):
-        device = block.vq.embedding.weight.device
-        centroids, counts = kmeans_pca_fit_dim(feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
-        block.vq.embedding.weight.data = centroids.to(device)
+    if isinstance(feat_list[0], (list,tuple)):
+        for block, feat in zip(model.blocks, feat_list):
+            # for vq qkv , vq proj
+            device = block.vq.embedding.weight.device
+            qkv_feat = feat[0]
+            proj_feat = feat[1]
+            qkv_centroids, counts = kmeans_pca_fit_dim(qkv_feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            block.vq.embedding.weight.data = qkv_centroids.to(device)
+
+            # proj_centroids, counts = kmeans_pca_fit_dim(proj_feat, block.attn.vq.embedding.weight.data.shape[0], block.attn.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            # block.attn.vq.embedding.weight.data = proj_centroids.to(device)
+
+            # # for vq qkv , vq ffn
+            # device = block.vq.embedding.weight.device
+            # attn_feat = feat[0]
+            # ffn_feat = feat[1]
+            # ffn_centroids, counts = kmeans_pca_fit_dim(ffn_feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            # block.vq.embedding.weight.data = ffn_centroids.to(device)
+
+            # attn_centroids, counts = kmeans_pca_fit_dim(attn_feat, block.attnvq.embedding.weight.data.shape[0], block.attnvq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            # block.attnvq.embedding.weight.data = attn_centroids.to(device)
+    else:
+        for block, feat in zip(model.blocks, feat_list):
+            
+            # device = block.vq.embedding.weight.device
+            # centroids, counts = kmeans_pca_fit_dim(feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            # block.vq.embedding.weight.data = centroids.to(device)
+
+            device = block.attn.vq.embedding.weight.device
+            attn_centroids, counts = kmeans_pca_fit_dim(feat, block.attn.vq.embedding.weight.data.shape[0], block.attn.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            block.attn.vq.embedding.weight.data = attn_centroids.to(device)
 
 def init_fsqt(model, feat_list):
     
     print('===============================================================init T of fsq using vit features')
     step = 0.1
-    t_range = (torch.arange(1, 51) * step).to(feat_list[0].device)  # 1→0.1, 2→0.2,..., 50→5.0
+    t_range = (torch.arange(1, 101) * step).round(decimals=1).to(feat_list[0].device)  # 1→0.1, 2→0.2,..., 50→5.0
     for block, feat in zip(model.blocks, feat_list):
         fsq = block.vq
         codebook_dim = block.vq.codebook_dim
-        max_value = feat.max()
-        min_value = feat.min()
-        mean = feat.mean()
-        std = feat.std()
-        input = mean + std * torch.randn(1, 100000, codebook_dim, device=feat.device)
-        input = torch.clamp(input, min=-min_value, max=max_value)
-        print(f'mean: {mean}, std: {std}, max_value: {max_value}, min_value: {min_value}')
+        # max_value = feat.max()
+        # min_value = feat.min()
+        # mean = feat.mean()
+        # std = feat.std()
+        # input = mean + std * torch.randn(1, 100000, codebook_dim, device=feat.device)
+        # input = torch.clamp(input, min=-min_value, max=max_value)
+        # print(f'mean: {mean}, std: {std}, max_value: {max_value}, min_value: {min_value}')
 
-        # samples = rearrange(feat, 'b h d ->(b h) d') 
-        # x_np = samples.cpu().numpy()
-        # pca = PCA(n_components=codebook_dim)
-        # x_reduced = pca.fit_transform(x_np)
-        # input = torch.from_numpy(x_reduced)
-        # input = rearrange(input, '(b h) d -> b h d', b=feat.shape[0], h=feat.shape[1]).to(feat.device)
+        samples = rearrange(feat, 'b h d ->(b h) d') 
+        x_np = samples.cpu().numpy()
+        pca = PCA(n_components=codebook_dim)
+        x_reduced = pca.fit_transform(x_np)
+        input = torch.from_numpy(x_reduced)
+        input = rearrange(input, '(b h) d -> b h d', b=feat.shape[0], h=feat.shape[1]).to(feat.device)
 
         error_recoed = []
         for i, t in enumerate(t_range):
@@ -460,7 +492,7 @@ def init_fsqt(model, feat_list):
             output1 = fsq.quantize(input)
             error = torch.abs(output1 - input).sum()
             error_recoed.append(error)
-            print(f'i: {i}, error: {error}, t: {t}')
+            # print(f'i: {i}, error: {error}, t: {t}')
         t_optimal = t_range[error_recoed.index(min(error_recoed))]
         fsq.T = t_optimal
         print(f't_optimal: {t_optimal}')
@@ -554,6 +586,8 @@ def main():
         num_classes=args.num_classes,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
+        attn_drop_rate=args.attn_drop_rate,
+        proj_drop_rate=args.proj_drop_rate,
         drop_block_rate=args.drop_block,
         global_pool=args.gp,
         bn_momentum=args.bn_momentum,
@@ -835,6 +869,38 @@ def main():
         use_multi_epochs_loader=args.use_multi_epochs_loader,
         worker_seeding=args.worker_seeding,
     )
+    loader_init = None
+    if args.kmeans_init_code or args.init_fsqt:
+        loader_init = create_loader(
+            dataset_train,
+            input_size=data_config['input_size'],
+            batch_size=6000,
+            is_training=True,
+            use_prefetcher=args.prefetcher,
+            no_aug=args.no_aug,
+            re_prob=args.reprob,
+            re_mode=args.remode,
+            re_count=args.recount,
+            re_split=args.resplit,
+            scale=args.scale,
+            ratio=args.ratio,
+            hflip=args.hflip,
+            vflip=args.vflip,
+            color_jitter=args.color_jitter,
+            auto_augment=args.aa,
+            num_aug_repeats=args.aug_repeats,
+            num_aug_splits=num_aug_splits,
+            interpolation=train_interpolation,
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=1,
+            distributed=args.distributed,
+            collate_fn=collate_fn,
+            pin_memory=False,
+            device=device,
+            use_multi_epochs_loader=False,
+            worker_seeding=args.worker_seeding,
+        )
 
     eval_workers = args.workers
     if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
@@ -879,14 +945,21 @@ def main():
         kl_criterion =  DistillCE().to(device=device)
     elif args.Disfn=='cos':
         kl_criterion =  DistillCosSim(args.top_k).to(device=device)
+    elif args.Disfn=='klandcos':
+        kl_criterion =  DistillKLandCosSim(args.T).to(device=device)
+    elif args.Disfn=='DKD':
+        kl_criterion = DKD(args.T, alpha=0.5, beta=1.5).to(device=device)
     else:   
         kl_criterion =  DistillKL(args.T).to(device=device)
     if args.FLfn=='KL':
-        print('using KL loss for feature loss calculation')
+        print('======================================================================================================using KL loss for feature loss calculation')
         feature_criterion =  FeatureLossKL(reduction=args.featureloss_reduction).to(device=device)
     elif args.FLfn=='cos':
         print('using cos loss for feature loss calculation')
         feature_criterion =  FeatureLossCosine(reduction=args.featureloss_reduction).to(device=device)
+    elif args.FLfn=='klcos':
+        print('using cos and KL loss separately for feature distillation loss calculation')
+        feature_criterion =  FeatureLossCosineKL(reduction=args.featureloss_reduction).to(device=device)
     else:
         feature_criterion =  FeatureLossL2(reduction=args.featureloss_reduction).to(device=device)
         
@@ -986,7 +1059,14 @@ def main():
                 loss_scaler=loss_scaler,
                 model_ema=model_ema,
                 mixup_fn=mixup_fn,
+                loader_init=loader_init if loader_init else None
             )
+            if loader_init:
+                # onlu use once
+                if hasattr(loader_init, '_workers'):
+                    loader_init._shutdown_workers() 
+                del loader_init
+            loader_init=None
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if utils.is_primary(args):
@@ -1061,6 +1141,7 @@ def train_one_epoch(
         loss_scaler=None,
         model_ema=None,
         mixup_fn=None,
+        loader_init=None
 ):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
@@ -1090,6 +1171,17 @@ def train_one_epoch(
     data_start_time = update_start_time = time.time()
     optimizer.zero_grad()
     update_sample_count = 0
+
+    if loader_init and not args.resume:
+        for batch_idx, (input, target) in enumerate(loader_init):
+            with torch.no_grad():
+                teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
+            if args.vqtype == 'vq' and args.kmeans_init_code:
+                init_codebook(model,init_feat_list)
+            elif args.vqtype == 'fsq' and args.init_fsqt:
+                init_fsqt(model,init_feat_list)
+            break
+
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_batch_idx
         need_update = last_batch or (batch_idx + 1) % accum_steps == 0
@@ -1109,14 +1201,17 @@ def train_one_epoch(
 
         def _forward():
             with amp_autocast():
-                teacher_output, teacher_feat = teacher_model(input,is_feat=True)
+                with torch.no_grad():
+                    teacher_output, teacher_feat = teacher_model(input,is_feat=True)
                 output, dict_loss, feat = model(input,is_feat=True)
                 loss = loss_fn(output, target) * args.celoss_weight
                 loss_dict = dict_loss * args.dictloss_weight
-                loss_kl =  kl_criterion(output, teacher_output.detach()) * args.klloss_weight
+                if isinstance(kl_criterion, DKD):
+                    loss_kl =  kl_criterion(output, teacher_output.detach(), target) * args.klloss_weight
+                else:
+                    loss_kl =  kl_criterion(output, teacher_output.detach()) * args.klloss_weight
                 loss_feature = feature_criterion(feat,teacher_feat) *args.featureloss_weight
                 sum_loss = [loss , loss_dict ,loss_kl, loss_feature]
-            
             return sum_loss
 
         def _backward(_loss):
@@ -1147,21 +1242,9 @@ def train_one_epoch(
 
         if has_no_sync and not need_update:
             with model.no_sync():
-                if epoch==0 and batch_idx==0:
-                    teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
-                    if args.vqtype == 'vq' and args.kmeans_init_code:
-                        init_codebook(model,init_feat_list)
-                    elif args.vqtype == 'fsq' and args.init_fsqt:
-                        init_fsqt(model,init_feat_list)
                 loss = _forward()
                 _backward(loss)
         else:
-            if epoch==0 and batch_idx==0:
-                teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
-                if args.vqtype == 'vq' and args.kmeans_init_code:
-                    init_codebook(model,init_feat_list)
-                elif args.vqtype == 'fsq' and args.init_fsqt:
-                    init_fsqt(model,init_feat_list)
             loss = _forward()
             # for name, param in model.named_parameters():
             #     if param.grad is None or not param.requires_grad:
@@ -1169,7 +1252,8 @@ def train_one_epoch(
             _backward(loss)
 
         if not args.distributed:
-            losses_m.update(loss[0].item() * accum_steps, input.size(0))
+            losses_m.update(loss[0].item(), input.size(0))
+            # losses_m.update(loss[0].item() * accum_steps, input.size(0))
             losses_dict_m.update(loss[1].item(), input.size(0))
             losses_kl_m.update(loss[2].item(), input.size(0))
             losses_feature_m.update(loss[3].item(), input.size(0))

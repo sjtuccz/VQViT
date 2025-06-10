@@ -77,7 +77,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, init_codebook_feat=False):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -96,9 +96,13 @@ class Attention(nn.Module):
             x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
+        init_feat = x
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+        if init_codebook_feat:
+            return x, init_feat
+        else:
+            return x
 
 
 class LayerScale(nn.Module):
@@ -154,12 +158,19 @@ class Block(nn.Module):
 
     def forward(self, x, is_feat=False, init_codebook_feat = False):
         input0 = x
-        x = self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        x=self.norm1(x)
+        # init_attn = x
+        if init_codebook_feat:
+            x, attn_proj_init_feat = self.attn(x, init_codebook_feat=init_codebook_feat)
+        else:
+            x=self.attn(x)
+        feat_attn = x
+        x = self.drop_path1(self.ls1(x))
         # feat = x # 蒸馏位置1
         x = input0 + x
-        # feat = x # 蒸馏位置2
+        feat0 = x # 蒸馏位置2
         input = x
-        init_feat = input
+        init_feat = x
         x = self.norm2(x)
         x = self.mlp(x)
         # feat = x  # 蒸馏位置3
@@ -168,9 +179,18 @@ class Block(nn.Module):
         x = x + input
         feat = x  # 蒸馏位置4
         if is_feat:
-            return x, feat
+            # return x, feat0
+            # return x, (feat_attn, feat)
+            # return x, feat0
+            # return x, feat
+            return x, (feat0, feat)
         elif init_codebook_feat:
-            return x, init_feat
+            # return x, init_feat
+            # return x, input0
+            # return x, init_attn
+            # return x, attn_proj_init_feat
+            return x, (input0,attn_proj_init_feat)
+            # return x, (input0,init_feat) 
         else:
             return x
         # x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))

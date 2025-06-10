@@ -155,23 +155,36 @@ parser.add_argument('--repara', action='store_true', default=False,
                     help='vqvit pre calculate .')
 
 
-def fix_exact_params(params, model):
-    if not model.blocks[0].vq.embedding:
+
+def fix_exact_params(params: int, model: torch.nn.Module) -> int:
+    # 1. 收集所有名称包含 "vq" 的参数及其形状
+    vq_params_dict = {}
+    for name, param in model.named_parameters():
+        if "vq" in name:
+            
+            shape = param.data.shape
+            if shape not in vq_params_dict:
+                vq_params_dict[shape] = []
+            vq_params_dict[shape].append(param.data)
+    
+    # 2. 如果没有 "vq" 参数，直接返回原 params
+    if not vq_params_dict:
         return params
-    embedding_para_list=[]
-    for block in model.blocks:
-        embedding_para_list.append(block.vq.embedding.weight.data)
-    stacked = torch.stack(embedding_para_list)  # 形状变为 (N, 1024, 8)
-    if (stacked == stacked[0]).all().item():
-        print('=========================all codebook are same, fixing exact params')
-        exact_params = params-stacked.numel()+embedding_para_list[0].numel()
-        return exact_params
+    # 3. 对每组相同形状的参数检查是否完全相同
+    total_reduction = 0
+    for shape, param_list in vq_params_dict.items():
+        if len(param_list) > 1:  # 只有多个参数时才需要检查
+            stacked = torch.stack(param_list)  # (N, *shape)
+            if (stacked == stacked[0]).all().item():  # 检查是否全相同
+                print(f'=========================All "vq" parameters with shape {shape} are identical, fixing exact params')
+                # 计算修正量：总参数量 - (重复参数的总大小) + 单个参数的大小
+                total_reduction += (len(param_list) - 1) * param_list[0].numel()
+    
+    # 4. 返回修正后的参数量
+    if total_reduction > 0:
+        return params - total_reduction
     else:
         return params
-    # print(embedding_para_list[0].numel())
-    # print(stacked.numel())
-    # exact_params = params-stacked.numel()+embedding_para_list[0].numel()
-    # return exact_params
 def format_param_count(param_count, decimal_places=2):
     if param_count >= 1e9:
         return f"{round(param_count / 1e9, decimal_places)}B" 
@@ -236,7 +249,7 @@ def validate(args):
         args.num_classes = model.num_classes
 
     if args.checkpoint:
-        load_checkpoint(model, args.checkpoint, args.use_ema)
+        load_checkpoint(model, args.checkpoint, args.use_ema, strict=False)
 
     # if args.pre_calculate:
         # model.pre_calculate()

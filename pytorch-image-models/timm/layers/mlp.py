@@ -25,6 +25,7 @@ class Mlp(nn.Module):
             use_conv=False,
     ):
         super().__init__()
+        # print(f"hidden features dim of mlp: {hidden_features}")
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         bias = to_2tuple(bias)

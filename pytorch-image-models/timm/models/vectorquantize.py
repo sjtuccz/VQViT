@@ -155,15 +155,18 @@ class FSQ(nn.Module):
     
 
 class FSQ_T(nn.Module):
-    def __init__(self, n_e, channels_in, channels_dim, index=0, levels=[15,15,15], T=2):
+    def __init__(self, n_e, channels_in, channels_dim, index=0, levels=[15,15,15], T=1):
         super().__init__()
+        print(f"Using FSQ_T,T= {T}")
+
         self.compress = nn.Linear(channels_in, channels_dim)
         self.expand = nn.Linear(channels_dim, channels_in)
         assert len(levels) == channels_dim
         self.codebook_dim = len(levels)
         # self._levels = torch.tensor(levels, dtype=torch.int32)
         self.register_buffer("_levels", torch.tensor(levels, dtype=torch.int32))
-        self.codebook_size = self._levels.prod().item()
+        # self.codebook_size = self._levels.prod().item()
+        self.register_buffer("codebook_size", self._levels.prod())
         self.register_buffer("T", torch.tensor(T, dtype=torch.int32))
         basis = torch.cumprod(
                 torch.tensor([1] + levels[:-1], dtype=torch.int32), 
@@ -175,7 +178,9 @@ class FSQ_T(nn.Module):
     def reparameterize(self):
         print('using FSQ reparameterize')
         self.is_pre_cal = True
+        print(f"codebook_size: {self.codebook_size}")
         implicit_codebook = self._indices_to_codes(torch.arange(self.codebook_size))
+        print(f"implicit_codebook: {implicit_codebook.shape}")
         # implicit_codebook = torch.tensor(implicit_codebook).to(self.expand.weight.device)
         expand_dict = self.expand(implicit_codebook)
         del self.expand
@@ -246,73 +251,330 @@ class FSQ_T(nn.Module):
         quantized = self.round_ste(self.bound(z)).to(z.device)
         half_width = (self._levels // 2).to(z.device)# Renormalize to [-T, T].
         return quantized / half_width * self.T
+import numpy as np
+def analyze_tensor(x, bins=10, name="tensor"):
+    """
+    分析张量的统计信息，并打印结果。
     
+    Args:
+        x (torch.Tensor): 输入张量。
+        bins (int): 直方图的分桶数量（用于统计值分布）。
+        name (str): 张量名称（用于打印标识）。
+    """
+    if not isinstance(x, torch.Tensor):
+        raise ValueError("Input must be a torch.Tensor.")
+    
+    # 最大值、最小值、均值、标准差
+    x_np = x.detach().cpu().numpy()  # 转为NumPy数组（脱离计算图）
+    max_val = np.max(x_np)
+    min_val = np.min(x_np)
+    mean_val = np.mean(x_np)
+    std_val = np.std(x_np)
+    
+    # 直方图统计（分桶区间）
+    hist, bin_edges = np.histogram(x_np, bins=bins)
+    bin_ranges = [f"[{bin_edges[i]:.4f}, {bin_edges[i+1]:.4f})" for i in range(bins)]
+    
+    # 打印结果
+    print(f"\n===== Tensor Analysis: {name} =====")
+    print(f"Shape: {x.shape}")
+    print(f"Max: {max_val:.6f}, Min: {min_val:.6f}, Mean: {mean_val:.6f}, Std: {std_val:.6f}")
+    print("\nValue Distribution (Histogram):")
+    for i in range(bins):
+        print(f"Bin {i+1}: {bin_ranges[i]} -> {hist[i]} values ({hist[i] / x.numel() * 100:.2f}%)")
+    
+    # 可选：返回统计结果（如需进一步处理）
+    stats = {
+        "max": max_val,
+        "min": min_val,
+        "mean": mean_val,
+        "std": std_val,
+        "histogram": (hist, bin_edges)
+    }
+    return stats
+class FSQ_trainableT(nn.Module):
+    def __init__(self, n_e, channels_in, channels_dim, index=0, levels=[15,15,15], T=0, T_min=0.1, T_max=5.0):
+        super().__init__()
+        print(f"Using FSQ_trainableT, T init= {T}, T_max= {T_max}")
 
+        self.compress = nn.Linear(channels_in, channels_dim)
+        self.expand = nn.Linear(channels_dim, channels_in)
+        assert len(levels) == channels_dim
+        self.codebook_dim = len(levels)
+        # self._levels = torch.tensor(levels, dtype=torch.int32)
+        self.register_buffer("_levels", torch.tensor(levels, dtype=torch.int32))
+        self.codebook_size = self._levels.prod().item()
+        self.register_buffer("T_min", torch.tensor(T_min, dtype=torch.float))
+        self.register_buffer("T_max", torch.tensor(T_max, dtype=torch.float))
+        self.T_raw = nn.Parameter(torch.tensor(T, dtype=torch.float32))
+
+        basis = torch.cumprod(
+                torch.tensor([1] + levels[:-1], dtype=torch.int32), 
+                dim=0
+            )
+        self.register_buffer("_basis", basis)
+
+        self.is_pre_cal = False
+
+    def get_T(self):
+        # 后续可以改进该部分代码，在推理阶段直接获取T_sigmoid，不要重复计算。
+        # Sigmoid映射到[T_min, T_max]
+        T_sigmoid = self.T_min + (self.T_max - self.T_min) * torch.sigmoid(self.T_raw)
+        if random.random() < 0.00005:
+            print(f"FSQ T_sigmoid: {T_sigmoid}")
+        return T_sigmoid
+    
+    def reparameterize(self):
+        print('using FSQ_trainableT reparameterize')
+        self.is_pre_cal = True
+        implicit_codebook = self._indices_to_codes(torch.arange(self.codebook_size))
+        # implicit_codebook = torch.tensor(implicit_codebook).to(self.expand.weight.device)
+        expand_dict = self.expand(implicit_codebook)
+        del self.expand
+        return expand_dict
+    
+    def forward(self, z):
+        '''
+        z: (b, h , channels_in)
+        '''
+        rand = random.random()
+
+
+        input = z
+        z = self.compress(z) # (b, h , dim)
+        # print(f"z shape: {z.shape}")
+        codes = self.quantize(z) # 输出范围(-T,T)
+        quantization_error = torch.mean((z-codes)**2)
+        # if quantization_error>1.0:
+        if rand < 0.0005:
+            # analyze_tensor(input, name="input")
+            # analyze_tensor(z, name="compress")
+            # analyze_tensor(codes, name="codes")
+            indices = self.codes_to_indices(codes)
+            unique_index=torch.unique(indices)
+            num_feature = z.shape[0] * z.shape[1]
+            print(f"ActivatedCode:{unique_index.shape[0]}, NumFeature: {num_feature}, CodebookSize: {self.codebook_size}, QuantiError: {quantization_error}")
+        # quantization_error = (z - codes).abs().mean()
+        
+        if not self.training and self.is_pre_cal:
+            indices = self.codes_to_indices(codes)
+            return indices
+        else:
+            z_q = self.expand(codes)
+            return z_q , quantization_error
+            # return z_q , torch.tensor(0.0).cuda()
+    
+    def indices_to_level_indices(self, indices):
+        """ Converts indices to indices at each level, perhaps needed for a transformer with factorized embeddings """
+        indices = rearrange(indices, '... -> ... 1')
+        codes_non_centered = (indices // self._basis) % self._levels
+        return codes_non_centered
+
+    def _scale_and_shift_inverse(self, zhat):
+        half_width = self._levels // 2
+        T_sigmoid = self.get_T()
+        return (zhat - half_width) / half_width *T_sigmoid
+
+    def _indices_to_codes(self, indices):
+        level_indices = self.indices_to_level_indices(indices)
+        codes = self._scale_and_shift_inverse(level_indices)
+        return codes
+    
+    def _scale_and_shift(self, zhat_normalized):
+        half_width = self._levels // 2
+        T_sigmoid = self.get_T()
+        return (zhat_normalized / T_sigmoid * half_width) + half_width
+    
+    def codes_to_indices(self, zhat):
+        """ Converts a `code` to an index in the codebook. """
+        assert zhat.shape[-1] == self.codebook_dim
+        zhat = self._scale_and_shift(zhat)
+        return (zhat * self._basis).sum(dim=-1).to(torch.int32)
+
+    def round_ste(self, z: torch.Tensor) ->  torch.Tensor:
+        """Round with straight through gradients."""
+        zhat = z.round()
+        return z + (zhat - z).detach()
+        # return rotate_to(z, zhat) 
+
+    def bound(self, z, eps: float = 1e-3):
+        """ Bound `z`, an array of shape (..., d). """
+        half_l = ((self._levels - 1) * (1 + eps) / 2)
+        offset = torch.where(self._levels % 2 == 0, 0.5, 0.0).to(z.device)
+        shift = torch.atanh(offset / half_l)
+        T_sigmoid = self.get_T()
+        z_bound = torch.tanh(z/T_sigmoid + shift) * half_l - offset
+        return z_bound
+    
+    def quantize(self, z):
+        """ Quantizes z, returns quantized zhat, same shape as z. """
+        quantized = self.round_ste(self.bound(z)).to(z.device)
+        half_width = (self._levels // 2).to(z.device)# Renormalize to [-T, T].
+        T_sigmoid = self.get_T()
+        return quantized / half_width * T_sigmoid
+    
+class FSQ_AdaptiveQuant(nn.Module):
+    def __init__(self, n_e, channels_in, channels_dim, levels=[15,15,15], bandwidth=0.5):
+        super().__init__()
+        self.compress = nn.Linear(channels_in, channels_dim)
+        self.expand = nn.Linear(channels_dim, channels_in)
+        self.levels = torch.tensor(levels, dtype=torch.int32)
+        self.bandwidth = bandwidth  # KDE带宽参数
+        self.codebook_dim = len(levels)
+        
+        # 初始化动态量化参数
+        self.quant_centers = nn.ParameterList([
+            nn.Parameter(torch.linspace(-1, 1, levels[i])) 
+            for i in range(self.codebook_dim)
+        ])
+
+    def kde_estimate(self, z):
+        """核密度估计：计算每个维度的数据密度分布"""
+        # z: (batch, seq_len, dim)
+        z = z.reshape(-1, self.codebook_dim)  # 展平为 (N, dim)
+        kde_weights = []
+        for d in range(self.codebook_dim):
+            samples = z[:, d].unsqueeze(0)  # (1, N)
+            centers = self.quant_centers[d].unsqueeze(1)  # (levels[d], 1)
+            # 用高斯核计算密度权重
+            weights = torch.exp(-0.5 * ((centers - samples) / self.bandwidth) **2)  # (levels[d], N)
+            weights = weights.mean(dim=1)  # (levels[d],)
+            kde_weights.append(weights)
+        return kde_weights  # List[tensor(levels[d])]
+
+    def adaptive_quantize(self, z, kde_weights):
+        """非均匀量化：根据密度调整量化间隔"""
+        quantized = []
+        for d in range(self.codebook_dim):
+            # 动态调整量化中心（密度高的区域中心更密集）
+            centers = self.quant_centers[d]  # (levels[d],)
+            weights = kde_weights[d] + 1e-6  # 避免除零
+            # 密度加权后的量化步长
+            scaled_centers = centers * (1.0 / weights.sum()) * weights
+            # 最近邻量化（STE）
+            dist = torch.abs(z[..., d].unsqueeze(-1) - scaled_centers.unsqueeze(0))  # (..., levels[d])
+            _, idx = torch.min(dist, dim=-1)
+            q = scaled_centers[idx]
+            quantized.append(q)
+        return torch.stack(quantized, dim=-1)  # (..., dim)
+
+    def forward(self, z):
+        z_compressed = self.compress(z)  # (b, h, dim)
+        kde_weights = self.kde_estimate(z_compressed)  # 密度估计
+        codes = self.adaptive_quantize(z_compressed, kde_weights)
+        codes= codes.reshape(z_compressed.shape)  # 自适应量化
+        # codes = codes.detach() + z_compressed - z_compressed.detach()  # STE
+        z_q = self.expand(codes)
+        return z_q, torch.tensor(0.0).to(z.device)
+class FSQ_AdaptiveQuant_todo_fix(nn.Module):
+    def __init__(self, n_e, channels_in, channels_dim, levels=[15,15,15], bandwidth=0.5):
+        super().__init__()
+        self.compress = nn.Linear(channels_in, channels_dim)
+        self.expand = nn.Linear(channels_dim, channels_in)
+        self.levels = torch.tensor(levels, dtype=torch.int32)
+        self.bandwidth = bandwidth
+        self.codebook_dim = len(levels)
+        
+        # 初始化动态量化参数（填充到最大level长度以便向量化）
+        self.max_level = max(levels)
+        padded_centers = []
+        for i in range(self.codebook_dim):
+            centers = torch.linspace(-1, 1, levels[i])
+            # 用NaN填充不足部分（后续计算会忽略）
+            padded = F.pad(centers, (0, self.max_level - levels[i]), value=float('nan'))
+            padded_centers.append(padded)
+        self.quant_centers = nn.Parameter(torch.stack(padded_centers))  # (codebook_dim, max_level)
+
+    def kde_estimate(self, z):
+        """完全向量化的核密度估计"""
+        # z: (batch, seq_len, dim) -> (N, dim)
+        z_flat = z.reshape(-1, self.codebook_dim)
+        
+        # 计算高斯核密度
+        centers = self.quant_centers.unsqueeze(0)  # (1, dim, max_level)
+        samples = z_flat.unsqueeze(-1)           # (N, dim, 1)
+        weights = torch.exp(-0.5 * ((centers - samples) / self.bandwidth) **2)
+        
+        # 创建掩码忽略NaN填充部分
+        mask = ~torch.isnan(self.quant_centers).unsqueeze(0)
+        weights = weights * mask.float()
+        
+        # 按有效中心点数量归一化
+        kde_weights = weights.sum(dim=0) / mask.sum(dim=0).float()  # (dim, max_level)
+        return kde_weights
+
+    def adaptive_quantize(self, z, kde_weights):
+        """完全向量化的自适应量化"""
+        # z: (b, s, dim)
+        # kde_weights: (dim, max_level)
+        
+        # 动态调整中心点
+        valid_mask = ~torch.isnan(self.quant_centers)
+        weights_sum = kde_weights.sum(dim=1, keepdim=True)
+        scaled_centers = torch.where(
+            valid_mask,
+            self.quant_centers * (1.0 / weights_sum) * kde_weights,
+            torch.zeros_like(self.quant_centers)
+        )
+        
+        # 并行计算最近邻
+        dist = torch.abs(z.unsqueeze(-1) - scaled_centers.unsqueeze(0).unsqueeze(0))  # (b, s, dim, max_level)
+        _, idx = torch.min(dist, dim=-1)  # (b, s, dim)
+        
+        # 收集量化值
+        expanded_centers = scaled_centers.expand(z.size(0), z.size(1), *scaled_centers.shape)
+        quantized = torch.gather(
+            expanded_centers,  # (b, s, dim, max_level)
+            dim=-1,
+            index=idx.unsqueeze(-1)  # (b, s, dim, 1)
+        ).squeeze(-1)
+        
+        return quantized.detach()+z-z.detach()  # (b, s, dim)
+
+    def forward(self, z):
+        z_compressed = self.compress(z)  # (b, h, dim)
+        kde_weights = self.kde_estimate(z_compressed)  # (dim, max_level)
+        codes = self.adaptive_quantize(z_compressed, kde_weights)
+        z_q = self.expand(codes)
+        return z_q, torch.tensor(0.0).to(z.device)
 class VectorQuantizer(nn.Module):
     def __init__(self, n_e, channels_in, channels_dim, index=0):
         super().__init__()
         self.embedding = nn.Embedding(n_e, channels_dim)
         trunc_normal_(self.embedding.weight,mean=0.0, std=1.0, a=-3.0, b=3.0)
-        # self.compress = TokenToImageToToken(token_dim=384, image_size=224, patch_size=32, out_channels=2)
         self.compress = nn.Linear(channels_in, channels_dim)
         self.expand = nn.Linear(channels_dim, channels_in)
         self.codebook_size = n_e
+        self.codebook_dim = channels_dim
         self.is_pre_cal = False
     def reparameterize(self):
         print('using VQ reparameterize')
         self.is_pre_cal = True
         dict_embeding = self.embedding.weight.data.clone().detach()
         expand_dict = self.expand(dict_embeding)
-        # del self.embedding
         del self.expand
         return expand_dict
     def forward(self, z):
         input = z
-
-        # embedding_data = z.detach().cpu().numpy()
-        # mean = embedding_data.mean()
-        # std = embedding_data.std()
-        # min_val = embedding_data.min()
-        # max_val = embedding_data.max()
-        # print(f"   Mean: {mean}, Std: {std}, Min: {min_val}, Max: {max_val}")
-        
         z = self.compress(z)
         z_flattened = z.view(-1, z.shape[-1]) # bhw,c
         num_feature = z_flattened.shape[0]
         d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
             torch.sum(self.embedding.weight ** 2, dim=1) - 2 * \
             torch.einsum('bd,dn->bn', z_flattened, rearrange(self.embedding.weight, 'n d -> d n'))
-        # d = torch.cdist(z_flattened, self.embedding.weight, p=2)**2
-#  F.mse_loss
-# loss = F.mse_loss(z_q.detach(),z_flattened) + 0.5* F.mse_loss(z_q,z_flattened.detach())
-# loss = F.mse_loss(z_q,z_flattened)
         indices = torch.argmin(d, dim=1)
         if not self.training and self.is_pre_cal:
             return indices
         unique_index=torch.unique(indices)
         z_q = self.embedding(indices)
         if self.training:
-            # loss_dict = torch.mean((z_q - z_flattened) ** 2)
-            # loss_dict = 0.1*torch.mean((z_q.detach()-z_flattened)**2) + 1.0* \
-            # torch.mean((z_q - z_flattened.detach()) ** 2)
             loss_dict = torch.mean((z_q.detach()-z_flattened)**2) + 2.0* torch.mean((z_q - z_flattened.detach()) ** 2)
-            # loss_dict = 2.0* torch.mean((z_q - z_flattened.detach()) ** 2)
-            # z_q = z_q+ (z_flattened - z_flattened.data)
             z_q = z_q.detach()+ (z_flattened - z_flattened.detach())
-            # z_q = rotate_to(z_flattened, z_q)
             z_q = z_q.view(z.shape)
             z_q = self.expand(z_q)
-            # loss_dict = torch.mean((z_q - input) ** 2)
-            # indices2 = torch.argmin(d, dim=0)
-            # loss_dict2 = torch.mean((z_flattened[indices2, :].detach() - self.embedding.weight) ** 2)
             if random.random() < 0.0008:
                 print(f"activated vectors:{unique_index.shape[0]} , num feature: {num_feature}, num dict: {self.codebook_size}")
-            # loss_dict3=torch.mean((z_q-input)**2)
-            # loss_dict3 = F.mse_loss(z_q, input)
-            # loss = F.mse_loss(z_q.detach(),z_flattened) + 0.5* F.mse_loss(z_q,z_flattened.detach())
-            # return z_q, loss_dict
-            return z_q, loss_dict #+ orthogonal_loss_fn(self.embedding.weight)
-            # return z_q, loss_dict + 0.5*loss_dict2
+            return z_q, loss_dict 
         else:
             z_q = z_q.view(z.shape)
             z_q = self.expand(z_q)
