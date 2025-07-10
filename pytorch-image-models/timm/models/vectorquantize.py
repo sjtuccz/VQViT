@@ -94,8 +94,9 @@ class FSQ(nn.Module):
         z = self.compress(z) # (b, h , dim)
         # print(f"z shape: {z.shape}")
         codes = self.quantize(z)
+        quantization_error = torch.mean((z-codes.detach())**2)
         if random.random() < 0.0003:
-            quantization_error = (z - codes).abs().mean()
+            # quantization_error = (z - codes).abs().mean()
             indices = self.codes_to_indices(codes)
             unique_index=torch.unique(indices)
             num_feature = z.shape[0] * z.shape[1]
@@ -105,7 +106,8 @@ class FSQ(nn.Module):
             return indices
         else:
             z_q = self.expand(codes)
-            return z_q , torch.tensor(0.0).cuda()
+            # return z_q , torch.tensor(0.0).cuda()
+            return z_q , quantization_error
     
     def indices_to_level_indices(self, indices):
         """ Converts indices to indices at each level, perhaps needed for a transformer with factorized embeddings """
@@ -194,8 +196,9 @@ class FSQ_T(nn.Module):
         z = self.compress(z) # (b, h , dim)
         # print(f"z shape: {z.shape}")
         codes = self.quantize(z) # 输出范围(-T,T)
+        quantization_error = torch.mean((z-codes.detach())**2)
         if random.random() < 0.0003:
-            quantization_error = (z - codes).abs().mean()
+            
             indices = self.codes_to_indices(codes)
             unique_index=torch.unique(indices)
             num_feature = z.shape[0] * z.shape[1]
@@ -205,7 +208,8 @@ class FSQ_T(nn.Module):
             return indices
         else:
             z_q = self.expand(codes)
-            return z_q , torch.tensor(0.0).cuda()
+            return z_q , quantization_error
+            # return z_q , torch.tensor(0.0).cuda()
     
     def indices_to_level_indices(self, indices):
         """ Converts indices to indices at each level, perhaps needed for a transformer with factorized embeddings """
@@ -292,6 +296,129 @@ def analyze_tensor(x, bins=10, name="tensor"):
         "histogram": (hist, bin_edges)
     }
     return stats
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+class FSQ_GumbelSoftmax(nn.Module):
+    def __init__(self, n_e, channels_in, channels_dim, levels=[15, 15, 15], tau=1.0, hard=True):
+        super().__init__()
+        self.compress = nn.Linear(channels_in, channels_dim)
+        self.expand = nn.Linear(channels_dim, channels_in)
+        
+        self.levels = torch.tensor(levels, dtype=torch.int32)
+        self.codebook_size = self.levels.prod()
+        self.codebook_dim = len(levels)
+        self.n_e = n_e
+        
+        # 初始化所有维度的候选值（并行存储）
+        # codebook: (codebook_dim, max_level), 不足的用0填充（通过mask处理）
+        max_level = max(levels)
+        self.codebook = nn.Parameter(
+            torch.stack([
+                F.pad(torch.linspace(-1.0, 1.0, level), (0, max_level - level), value=0)
+                for level in levels
+            ])
+        )  # shape: (codebook_dim, max_level)
+        
+        # 创建mask，标记有效候选位置
+        self.register_buffer("codebook_mask", 
+            torch.stack([
+                F.pad(torch.ones(level), (0, max_level - level), value=0)
+                for level in levels
+            ]).bool()
+        )  # shape: (codebook_dim, max_level)
+        
+        # Gumbel-Softmax 参数
+        self.tau = tau
+        self.hard = hard
+        
+        # 预计算基础权重（用于索引计算）
+        basis = torch.cumprod(torch.tensor([1] + levels[:-1], dtype=torch.int32), dim=0)
+        self.register_buffer("_basis", basis)
+
+    def forward(self, z):
+        z = self.compress(z)  # (batch_size, seq_len, channels_dim)
+        codes, indices = self.quantize(z)
+        quantization_error = torch.mean((z - codes)**2)
+        z_q = self.expand(codes)
+        return z_q, quantization_error
+
+    def quantize(self, z):
+        """
+        向量化实现 Gumbel-Softmax 量化
+        z: (batch_size, seq_len, channels_dim)
+        """
+        batch_size, seq_len, _ = z.shape
+        max_level = self.codebook.size(1)
+        
+        # 计算所有维度的距离矩阵
+        # z_expand: (batch_size, seq_len, channels_dim, 1)
+        # codebook: (1, 1, channels_dim, max_level)
+        distances = torch.abs(
+            z.unsqueeze(-1) - self.codebook.unsqueeze(0).unsqueeze(0)
+        )  # shape: (batch_size, seq_len, channels_dim, max_level)
+        
+        # 应用mask，无效位置填充大数
+        distances = torch.where(
+            self.codebook_mask.unsqueeze(0).unsqueeze(0),
+            distances,
+            torch.tensor(float('inf'), device=z.device)
+        )
+        
+        # Gumbel-Softmax 采样
+        logits = -distances
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10))
+        noisy_logits = (logits + gumbel_noise) / self.tau
+        probs = F.softmax(noisy_logits, dim=-1)  # (batch_size, seq_len, channels_dim, max_level)
+        
+        # 采样结果
+        if self.hard and not self.training:
+            # 硬性采样（推理）
+            indices = torch.argmax(probs, dim=-1)  # (batch_size, seq_len, channels_dim)
+            codes = torch.gather(
+                self.codebook.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1, -1),
+                dim=-1,
+                index=indices.unsqueeze(-1)
+            ).squeeze(-1)  # (batch_size, seq_len, channels_dim)
+        else:
+            # 软性采样（训练）
+            if self.hard:
+                # 直通梯度技巧
+                indices = torch.argmax(probs, dim=-1)
+                one_hot = F.one_hot(indices, num_classes=max_level).float()
+                codes = torch.einsum('b s d l, d l -> b s d', one_hot, self.codebook)
+                probs = (one_hot - probs).detach() + probs
+            else:
+                # 加权平均
+                codes = torch.einsum('b s d l, d l -> b s d', probs, self.codebook)
+                indices = torch.argmax(probs, dim=-1)
+        
+        return codes, indices
+
+    def codes_to_indices(self, codes):
+        """向量化索引查找"""
+        distances = torch.abs(
+            codes.unsqueeze(-1) - self.codebook.unsqueeze(0).unsqueeze(0)
+        )  # (batch_size, seq_len, channels_dim, max_level)
+        distances = torch.where(
+            self.codebook_mask.unsqueeze(0).unsqueeze(0),
+            distances,
+            torch.tensor(float('inf'), device=codes.device)
+        )
+        indices = torch.argmin(distances, dim=-1)
+        return indices
+
+    def indices_to_codes(self, indices):
+        """向量化候选值查找"""
+        return torch.gather(
+            self.codebook.unsqueeze(0).unsqueeze(0).expand(indices.size(0), indices.size(1), -1, -1),
+            dim=-1,
+            index=indices.unsqueeze(-1)
+        ).squeeze(-1)
+
 class FSQ_trainableT(nn.Module):
     def __init__(self, n_e, channels_in, channels_dim, index=0, levels=[15,15,15], T=0, T_min=0.1, T_max=5.0):
         super().__init__()
@@ -303,10 +430,13 @@ class FSQ_trainableT(nn.Module):
         self.codebook_dim = len(levels)
         # self._levels = torch.tensor(levels, dtype=torch.int32)
         self.register_buffer("_levels", torch.tensor(levels, dtype=torch.int32))
-        self.codebook_size = self._levels.prod().item()
+        self.register_buffer("codebook_size", torch.tensor(self._levels.prod(), dtype=torch.int32))
+        # self.codebook_size = self._levels.prod().item()
         self.register_buffer("T_min", torch.tensor(T_min, dtype=torch.float))
         self.register_buffer("T_max", torch.tensor(T_max, dtype=torch.float))
-        self.T_raw = nn.Parameter(torch.tensor(T, dtype=torch.float32))
+        # self.T_raw = nn.Parameter(torch.tensor(T, dtype=torch.float32))
+        self.T_raw = nn.Parameter(torch.tensor([T for _ in range(self.codebook_dim)], dtype=torch.float32))
+
 
         basis = torch.cumprod(
                 torch.tensor([1] + levels[:-1], dtype=torch.int32), 
@@ -319,8 +449,10 @@ class FSQ_trainableT(nn.Module):
     def get_T(self):
         # 后续可以改进该部分代码，在推理阶段直接获取T_sigmoid，不要重复计算。
         # Sigmoid映射到[T_min, T_max]
-        T_sigmoid = self.T_min + (self.T_max - self.T_min) * torch.sigmoid(self.T_raw)
-        if random.random() < 0.00005:
+        # T_sigmoid =  self.T_max * torch.sigmoid(self.T_raw)
+        # T_sigmoid = self.T_min + (self.T_max - self.T_min) * torch.sigmoid(self.T_raw)
+        T_sigmoid =  F.softplus(self.T_raw) 
+        if random.random() < 0.0001:
             print(f"FSQ T_sigmoid: {T_sigmoid}")
         return T_sigmoid
     
@@ -344,7 +476,9 @@ class FSQ_trainableT(nn.Module):
         z = self.compress(z) # (b, h , dim)
         # print(f"z shape: {z.shape}")
         codes = self.quantize(z) # 输出范围(-T,T)
-        quantization_error = torch.mean((z-codes)**2)
+        # quantization_error = torch.mean((z-codes)**2)
+        quantization_error = torch.mean((z-codes.detach())**2)
+        # codes  = codes.detach()+z-z.detach()
         # if quantization_error>1.0:
         if rand < 0.0005:
             # analyze_tensor(input, name="input")
@@ -395,6 +529,7 @@ class FSQ_trainableT(nn.Module):
         """Round with straight through gradients."""
         zhat = z.round()
         return z + (zhat - z).detach()
+        # return zhat
         # return rotate_to(z, zhat) 
 
     def bound(self, z, eps: float = 1e-3):

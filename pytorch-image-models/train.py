@@ -1027,6 +1027,8 @@ def train_one_epoch(
         def _forward():
             with amp_autocast():
                 output = model(input)
+                if isinstance(output, (list, tuple)):
+                    output = output[0]
                 loss = loss_fn(output, target)
             if accum_steps > 1:
                 loss /= accum_steps

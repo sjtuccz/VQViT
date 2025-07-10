@@ -1797,6 +1797,18 @@ def _create_vision_transformer(variant, pretrained=False, **kwargs):
         pretrained_strict=strict,
         **kwargs,
     )
+
+
+@register_model
+def vit_small_patch32_test(pretrained=False, **kwargs) -> VisionTransformer:
+    """ ViT-Small (ViT-S/32)
+    """
+    model_args = dict(patch_size=32, embed_dim=384, depth=6, num_heads=6)
+    model = _create_vision_transformer('vit_small_patch32_test', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+
 # for cifar: Reduce the input size to 32,reduce the patch size to 4, reduce the depth to 7
 @register_model
 def vit_test(pretrained=False, **kwargs) -> VisionTransformer:

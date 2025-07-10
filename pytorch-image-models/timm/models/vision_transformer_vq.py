@@ -30,7 +30,7 @@ from ._builder import build_model_with_cfg
 from ._manipulate import named_apply, checkpoint_seq, adapt_input_conv
 from ._registry import generate_default_cfgs, register_model, register_model_deprecations
 
-from timm.models.vectorquantize import VectorQuantizer_LossMask, VectorQuantizer_noLinear, VectorQuantizer_CosSim, VectorQuantizer, VectorQuantizer_LinearRebuild, VectorQuantizer_Sim, TokenToImageToToken, FSQ, FSQ_T,FSQ_trainableT, FSQ_AdaptiveQuant
+from timm.models.vectorquantize import VectorQuantizer_LossMask, VectorQuantizer_noLinear, VectorQuantizer_CosSim, VectorQuantizer, VectorQuantizer_LinearRebuild, VectorQuantizer_Sim, TokenToImageToToken, FSQ, FSQ_T,FSQ_trainableT, FSQ_AdaptiveQuant,FSQ_GumbelSoftmax
 
 __all__ = ['vqVisionTransformer']  # model_registry will add each entrypoint fn to this
 
@@ -123,31 +123,31 @@ class vq_attn_Attention(nn.Module):
         self.is_pre_cal = False
         if vq_type == 'vq':
             self.vq = VectorQuantizer(dic_n, dim, dic_dim, index)
-        elif vq_type == 'fsq':
-            # self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=2)
+        elif vq_type == 'tfsq':
             # self.vq = FSQ_AdaptiveQuant(dic_n, dim, dic_dim, levels=fsq_level)
             self.vq = FSQ_trainableT(dic_n, dim, dic_dim, index, levels=fsq_level, T=fsq_Tinit, T_max=fsq_Tmax)
-
+            # self.vq = FSQ_GumbelSoftmax(dic_n, dim, dic_dim, levels=fsq_level)
+        elif vq_type == 'fsq':
+            self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=1)
     def reparameterize(self, vq_embedding):
         '''
         vq_embedding: codebook->norm
         '''
         print('using Attention reparameterize')
         self.is_pre_cal = True
-        self.q_dict = nn.Embedding(vq_embedding.shape[0], self.dim)
-        self.k_dict = nn.Embedding(vq_embedding.shape[0], self.dim)
-        self.v_dict = nn.Embedding(vq_embedding.shape[0], self.dim)
-        # vq_dict = vq.reparameterize()
+        self.qkv_dict = nn.Embedding(vq_embedding.shape[0], 3*self.dim)
         vq_embedding = vq_embedding.unsqueeze(0)
         B, N, C = vq_embedding.shape
         qkv = self.qkv(vq_embedding).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
         q = q * self.scale
-        # print(f'q.shape rep: {q.shape}')
-        self.q_dict.weight.data.copy_(q.permute(0,2,1,3).reshape(-1, self.dim))
-        self.k_dict.weight.data.copy_(k.permute(0,2,1,3).reshape(-1, self.dim))
-        self.v_dict.weight.data.copy_(v.permute(0,2,1,3).reshape(-1, self.dim))
+        q_flat = q.permute(0, 2, 1, 3).reshape(-1, self.dim)  # shape: [B*N*num_heads, dim]
+        k_flat = k.permute(0, 2, 1, 3).reshape(-1, self.dim)
+        v_flat = v.permute(0, 2, 1, 3).reshape(-1, self.dim)
+        self.qkv_dict.weight.data.copy_(
+            torch.cat([q_flat, k_flat, v_flat], dim=1).reshape(-1, 3 * self.dim)
+        )
         del self.qkv
         del self.q_norm, self.k_norm, self.scale
 
@@ -163,12 +163,11 @@ class vq_attn_Attention(nn.Module):
             B, N, C = shape
             
             embedding_index_map =  x
-            qi=ki=vi = embedding_index_map
-
-            q = self.q_dict(qi).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-            k = self.k_dict(ki).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-            v = self.v_dict(vi).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-
+            qkv = self.qkv_dict(embedding_index_map).reshape(B, N, 3, self.num_heads, self.head_dim)
+            q, k, v = qkv.unbind(dim=2)
+            q = q.permute(0, 2, 1, 3)  # [B, num_heads, N, head_dim]
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
         else:
             B, N, C = x.shape
             qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -242,12 +241,14 @@ class vq_ffn_Block(nn.Module):
         if vq_type == 'vq':
             print(f'using vq, codebook: {dic_n, dic_dim}')
             self.vq = VectorQuantizer(dic_n, dim, dic_dim, index)
-        elif vq_type == 'fsq':
+        elif vq_type == 'tfsq':
             print(f'using FSQ_trainableT, levels={fsq_level}')
             # self.vq = FSQ(dic_n, dim, dic_dim, index, levels=fsq_level) #先确定在wd0.1的条件下是128更高 还是512b更高
             # self.vq = FSQ_AdaptiveQuant(dic_n, dim, dic_dim, levels=fsq_level)            
             self.vq = FSQ_trainableT(dic_n, dim, dic_dim, index, levels=fsq_level, T=fsq_Tinit,T_max=fsq_Tmax )
-            # self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=2)
+            # self.vq = FSQ_GumbelSoftmax(dic_n, dim, dic_dim, levels=fsq_level)
+        elif vq_type == 'fsq':
+            self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=1)
         
         self.norm2 = norm_layer(dim)
         self.mlp = mlp_layer(
@@ -279,11 +280,12 @@ class vq_ffn_Block(nn.Module):
         # feat = x # 蒸馏位置1
         x = input0 + x
         input = x
+        loss_dict=torch.tensor(0.0).cuda()
         if not self.training and self.is_pre_cal:
             embedding_index =  self.vq(x)
             z_q = self.pre_cal_dict(embedding_index)
             z_q = z_q.view(input.shape)
-            return z_q+input, embedding_index
+            return z_q+input, loss_dict
         else:
             feat0 = x # 蒸馏位置2
             x, loss_dict = self.vq(x)
@@ -296,7 +298,133 @@ class vq_ffn_Block(nn.Module):
             feat = x # 蒸馏位置4
             # return x, loss_dict, feat
             return x, loss_dict, (feat0, feat)
+class vq_attn_ffn_Block(nn.Module):
 
+    def __init__(
+            self,
+            dim,
+            num_heads,
+            mlp_ratio=4.,
+            qkv_bias=False,
+            qk_norm=False,
+            proj_drop=0.,
+            attn_drop=0.,
+            init_values=None,
+            drop_path=0.,
+            act_layer=nn.GELU,
+            norm_layer=nn.LayerNorm,
+            mlp_layer=Mlp,
+            dic_n=1024, dic_dim=8,
+            index=0,
+            vq_type='vq',
+            fsq_level = [7,7,7,7],
+            fsq_Tmax = 10,
+            fsq_Tinit=-1
+    ):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = vq_attn_Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            norm_layer=norm_layer,
+            # 暂时固定值
+            vq_type=vq_type,
+            fsq_level = fsq_level,
+            dic_n=1000, dic_dim=len(fsq_level), index=index,
+            fsq_Tmax = fsq_Tmax,
+            fsq_Tinit = fsq_Tinit
+            
+            # dic_n=dic_n, dic_dim=dic_dim, index=index
+        )
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        self.norm2 = norm_layer(dim)
+        self.mlp = mlp_layer(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
+        )
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.is_pre_cal = False
+        self.dict_n = dic_n
+        self.dim = dim
+        if vq_type == 'vq':
+            self.vq = VectorQuantizer(dic_n, dim, dic_dim, index)
+        elif vq_type == 'tfsq':
+            print(f'using FSQ_trainableT in attn,  levels={fsq_level}')
+            # self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=2)
+            # self.vq = FSQ_AdaptiveQuant(dic_n, dim, dic_dim, levels=fsq_level)
+            self.vq = FSQ_trainableT(dic_n, dim, dic_dim, index, levels=fsq_level, T=fsq_Tinit,T_max=fsq_Tmax)
+            self.ffn_vq = FSQ_trainableT(dic_n, dim, dic_dim, index, levels=fsq_level, T=fsq_Tinit,T_max=fsq_Tmax)
+            # self.vq = FSQ_GumbelSoftmax(dic_n, dim, dic_dim, levels=fsq_level)
+        elif vq_type == 'fsq':
+            self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=1)
+    def reparameterize(self):
+        print('using Block reparameterize')
+        self.is_pre_cal = True
+        vq_dict = self.vq.reparameterize()
+        vq_dict = self.norm1(vq_dict)
+        # print(f'vq_dict.shape: {vq_dict.shape}')
+        self.attn.reparameterize(vq_dict)
+        del self.norm1
+
+        self.ffn_dict = nn.Embedding(self.ffn_vq.codebook_size, self.dim)
+        vq_ffn_dict = self.ffn_vq.reparameterize()
+        x=self.norm2(vq_ffn_dict)
+        x=self.mlp(x)
+        x = self.ls2(x)
+        self.ffn_dict.weight.data.copy_(x)
+        del self.norm2
+        del self.mlp
+        del self.ls2
+
+    def forward(self, x):
+        input0 = x
+        if self.is_pre_cal:
+            shape = x.shape
+            qkv_vq_loss=ffn_vq_loss=torch.tensor(0.0).cuda()
+            embedding_index =  self.vq(x)
+            x, vq_proj_loss = self.attn(embedding_index, shape)
+            feat_attn = x
+            x = self.drop_path1(self.ls1(x))
+            # feat = x # 蒸馏位置1
+            x = input0 + x
+            input = x
+            
+            feat0 = x # 蒸馏位置2
+            ffn_embedding_index =  self.ffn_vq(x)
+            z_q = self.ffn_dict(ffn_embedding_index)
+            z_q = z_q.view(input.shape)
+            return z_q+input, 0.333*(qkv_vq_loss+vq_proj_loss+ffn_vq_loss)
+        else:
+            x, qkv_vq_loss = self.vq(x)
+            x, vq_proj_loss = self.attn(self.norm1(x))
+            feat_attn = x
+            x = self.drop_path1(self.ls1(x))
+            # feat = x # 蒸馏位置1
+            x = input0 + x
+            input = x
+            
+            feat0 = x # 蒸馏位置2
+            x, ffn_vq_loss = self.ffn_vq(x)
+            x = self.norm2(x)
+            x = self.mlp(x)
+            # feat = x # z蒸馏位置3
+            x = self.ls2(x)
+            x = self.drop_path2(x)
+            x = x + input
+            feat = x # 蒸馏位置4
+            # return x, loss_dict, feat0
+            # return x, qkv_vq_loss, (feat_attn,feat)
+            # return x, 0.5*qkv_vq_loss+0.5*vq_proj_loss, feat0
+            return x, 0.333*(qkv_vq_loss+vq_proj_loss+ffn_vq_loss), (feat0,feat)
 class vq_attn_Block(nn.Module):
 
     def __init__(
@@ -356,12 +484,14 @@ class vq_attn_Block(nn.Module):
         self.dim = dim
         if vq_type == 'vq':
             self.vq = VectorQuantizer(dic_n, dim, dic_dim, index)
-        elif vq_type == 'fsq':
+        elif vq_type == 'tfsq':
             print(f'using FSQ_trainableT in attn,  levels={fsq_level}')
             # self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=2)
             # self.vq = FSQ_AdaptiveQuant(dic_n, dim, dic_dim, levels=fsq_level)
             self.vq = FSQ_trainableT(dic_n, dim, dic_dim, index, levels=fsq_level, T=fsq_Tinit,T_max=fsq_Tmax)
-
+            # self.vq = FSQ_GumbelSoftmax(dic_n, dim, dic_dim, levels=fsq_level)
+        elif vq_type == 'fsq':
+            self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=1)
     def reparameterize(self):
         print('using Block reparameterize')
         self.is_pre_cal = True
@@ -584,23 +714,29 @@ class vqVisionTransformer(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         
         block_list = list()
+       
+        # block_list=[vq_attn_ffn_Block(
+        #         dim=embed_dim,
+        #         num_heads=num_heads,
+        #         mlp_ratio=mlp_ratio,
+        #         qkv_bias=qkv_bias,
+        #         qk_norm=qk_norm,
+        #         init_values=init_values,
+        #         proj_drop=proj_drop_rate,
+        #         attn_drop=attn_drop_rate,
+        #         drop_path=dpr[i],
+        #         norm_layer=norm_layer,
+        #         act_layer=act_layer,
+        #         mlp_layer=mlp_layer,
+        #         dic_n=dic_n, dic_dim=dic_dim,
+        #         index=i,
+        #         vq_type=vq_type,
+        #         fsq_level = fsq_level,
+        #         fsq_Tmax = fsq_Tmax , fsq_Tinit=fsq_Tinit
+        #     ) for i in range(depth)]
+
+
         for i in range(depth):
-            # if i==8:
-            #     block_list.append(Block(
-            #     dim=embed_dim,
-            #     num_heads=num_heads,
-            #     mlp_ratio=mlp_ratio,
-            #     qkv_bias=qkv_bias,
-            #     qk_norm=qk_norm,
-            #     init_values=init_values,
-            #     proj_drop=proj_drop_rate,
-            #     attn_drop=attn_drop_rate,
-            #     drop_path=dpr[i],
-            #     norm_layer=norm_layer,
-            #     act_layer=act_layer,
-            #     mlp_layer=mlp_layer,
-            # ))
-            # elif i%2==0:
             if i%2==0:
                 block_list.append(vq_ffn_Block(
                 dim=embed_dim,
@@ -619,7 +755,6 @@ class vqVisionTransformer(nn.Module):
                 index=i,
                 vq_type=vq_type,
                 fsq_level = fsq_level,
-                
                 fsq_Tmax = fsq_Tmax , fsq_Tinit=fsq_Tinit
             ) )
             else:
@@ -1234,6 +1369,10 @@ default_cfgs = {
     'vqvit_small_patch16_224': _cfg(),
     'vqvit_small_patch32_224': _cfg(),
     'vqvit_base_patch16_224': _cfg(),
+    'vqvit_base_patch32_224': _cfg(),
+    'vqvit_large_patch16_224': _cfg(),
+    'vqvit_large_patch32_224': _cfg(),
+    # 'vqvit_tiny_patch16_224.augreg_in21k_ft_in1k': _cfg(
     # 'vqvit_small_patch32_224.augreg_in21k_ft_in1k': _cfg(
     #     url='https://storage.googleapis.com/vit_models/augreg/S_32-i21k-300ep-lr_0.001-aug_light1-wd_0.03-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.03-res_224.npz',
     #     hf_hub_id='timm/',
@@ -1928,14 +2067,6 @@ def _create_vision_transformer(variant, pretrained=False, **kwargs):
         **kwargs,
     )
 
-
-@register_model
-def vqvit_test(pretrained=False, **kwargs) -> vqVisionTransformer:
-    """ ViT-Tiny (Vit-Ti/4)
-    """
-    model_args = dict(img_size=224,patch_size=16, embed_dim=768, depth=8, num_heads=8,mlp_ratio=3,qkv_bias=False)
-    model = _create_vision_transformer('vit_test', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
 # for cifar: Reduce the input size to 32,reduce the patch size to 4, reduce the depth to 7
 @register_model
 def vqvit_tiny_patch4_32(pretrained=False, **kwargs) -> vqVisionTransformer:
@@ -2016,24 +2147,24 @@ def vqvit_small_patch8_224(pretrained=False, **kwargs) -> vqVisionTransformer:
     return model
 
 
-# @register_model
-# def vit_base_patch32_224(pretrained=False, **kwargs) -> vqVisionTransformer:
-#     """ ViT-Base (ViT-B/32) from original paper (https://arxiv.org/abs/2010.11929).
-#     ImageNet-1k weights fine-tuned from in21k, source https://github.com/google-research/vision_transformer.
-#     """
-#     model_args = dict(patch_size=32, embed_dim=768, depth=12, num_heads=12)
-#     model = _create_vision_transformer('vit_base_patch32_224', pretrained=pretrained, **dict(model_args, **kwargs))
-#     return model
+@register_model
+def vqvit_base_patch32_224(pretrained=False, **kwargs) -> vqVisionTransformer:
+    """ ViT-Base (ViT-B/32) from original paper (https://arxiv.org/abs/2010.11929).
+    ImageNet-1k weights fine-tuned from in21k, source https://github.com/google-research/vision_transformer.
+    """
+    model_args = dict(patch_size=32, embed_dim=768, depth=12, num_heads=12)
+    model = _create_vision_transformer('vqvit_base_patch32_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
 
 
-# @register_model
-# def vit_base_patch32_384(pretrained=False, **kwargs) -> vqVisionTransformer:
-#     """ ViT-Base model (ViT-B/32) from original paper (https://arxiv.org/abs/2010.11929).
-#     ImageNet-1k weights fine-tuned from in21k @ 384x384, source https://github.com/google-research/vision_transformer.
-#     """
-#     model_args = dict(patch_size=32, embed_dim=768, depth=12, num_heads=12)
-#     model = _create_vision_transformer('vit_base_patch32_384', pretrained=pretrained, **dict(model_args, **kwargs))
-#     return model
+@register_model
+def vqvit_base_patch32_384(pretrained=False, **kwargs) -> vqVisionTransformer:
+    """ ViT-Base model (ViT-B/32) from original paper (https://arxiv.org/abs/2010.11929).
+    ImageNet-1k weights fine-tuned from in21k @ 384x384, source https://github.com/google-research/vision_transformer.
+    """
+    model_args = dict(patch_size=32, embed_dim=768, depth=12, num_heads=12)
+    model = _create_vision_transformer('vqvit_base_patch32_384', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
 
 
 @register_model
@@ -2066,13 +2197,13 @@ def vqvit_base_patch16_224(pretrained=False, **kwargs) -> vqVisionTransformer:
 #     return model
 
 
-# @register_model
-# def vit_large_patch32_224(pretrained=False, **kwargs) -> vqVisionTransformer:
-#     """ ViT-Large model (ViT-L/32) from original paper (https://arxiv.org/abs/2010.11929). No pretrained weights.
-#     """
-#     model_args = dict(patch_size=32, embed_dim=1024, depth=24, num_heads=16)
-#     model = _create_vision_transformer('vit_large_patch32_224', pretrained=pretrained, **dict(model_args, **kwargs))
-#     return model
+@register_model
+def vqvit_large_patch32_224(pretrained=False, **kwargs) -> vqVisionTransformer:
+    """ ViT-Large model (ViT-L/32) from original paper (https://arxiv.org/abs/2010.11929). No pretrained weights.
+    """
+    model_args = dict(patch_size=32, embed_dim=1024, depth=24, num_heads=16)
+    model = _create_vision_transformer('vqvit_large_patch32_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
 
 
 # @register_model
@@ -2085,14 +2216,14 @@ def vqvit_base_patch16_224(pretrained=False, **kwargs) -> vqVisionTransformer:
 #     return model
 
 
-# @register_model
-# def vit_large_patch16_224(pretrained=False, **kwargs) -> vqVisionTransformer:
-#     """ ViT-Large model (ViT-L/16) from original paper (https://arxiv.org/abs/2010.11929).
-#     ImageNet-1k weights fine-tuned from in21k @ 224x224, source https://github.com/google-research/vision_transformer.
-#     """
-#     model_args = dict(patch_size=16, embed_dim=1024, depth=24, num_heads=16)
-#     model = _create_vision_transformer('vit_large_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
-#     return model
+@register_model
+def vqvit_large_patch16_224(pretrained=False, **kwargs) -> vqVisionTransformer:
+    """ ViT-Large model (ViT-L/16) from original paper (https://arxiv.org/abs/2010.11929).
+    ImageNet-1k weights fine-tuned from in21k @ 224x224, source https://github.com/google-research/vision_transformer.
+    """
+    model_args = dict(patch_size=16, embed_dim=1024, depth=24, num_heads=16)
+    model = _create_vision_transformer('vqvit_large_patch16_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
 
 
 # @register_model

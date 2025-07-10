@@ -125,7 +125,7 @@ parser.add_argument('--dict-num', default=256, type=int, metavar='vqvit_dict',
                     help='vqvit dict size')
 parser.add_argument('--dict-dim', default=2, type=int, metavar='vqvit_dict_dim',
                     help='vqvit dict dim')
-parser.add_argument('--teacher-model', default='vit_small_patch16_224', type=str, metavar='TEACHER-MODEL',
+parser.add_argument('--teacher-model', default=None, type=str, metavar='TEACHER-MODEL',
                     help='Name of model to train (default: "countception"')
 group.add_argument('--pretrained', action='store_true', default=False,
                    help='Start with pretrained version of specified network (if avail)')
@@ -623,13 +623,15 @@ def main():
         freeze_but_keep_VQ_grad(model)
 
     init_teacher_checkpoint = args.teacher_checkpoint or args.initial_checkpoint
-    teacher_model = create_teacher_model(
-        model_name = args.teacher_model,
-        num_classes=args.num_classes,
-        checkpoint_path=init_teacher_checkpoint,
-        global_pool=args.gp,
-        img_size=args.img_size,
-    )
+    teacher_model = None
+    if (args.klloss_weight or args.featureloss_weight) and args.teacher_model:
+        teacher_model = create_teacher_model(
+            model_name = args.teacher_model,
+            num_classes=args.num_classes,
+            checkpoint_path=init_teacher_checkpoint,
+            global_pool=args.gp,
+            img_size=args.img_size,
+        )
     
     if args.head_init_scale is not None:
         with torch.no_grad():
@@ -650,7 +652,7 @@ def main():
         _logger.info(
             f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
         _logger.info(
-            f'Teacher Model {safe_model_name(args.teacher_model)} created, param count: {sum([m.numel() for m in teacher_model.parameters()])}' )
+            f'Teacher Model {safe_model_name(args.teacher_model)} created, param count: {sum([m.numel() for m in teacher_model.parameters()]) if teacher_model is not None else 0}' )
          
 
     data_config = resolve_data_config(vars(args), model=model, verbose=utils.is_primary(args))
@@ -668,10 +670,12 @@ def main():
 
     # move model to GPU, enable channels last layout if set
     model.to(device=device)
-    teacher_model.to(device=device)
+    if teacher_model:
+        teacher_model.to(device=device)
     if args.channels_last:
         model.to(memory_format=torch.channels_last)
-        teacher_model.to(memory_format=torch.channels_last)
+        if teacher_model:
+            teacher_model.to(memory_format=torch.channels_last)
 
     # setup synchronized BatchNorm for distributed training
     if args.distributed and args.sync_bn:
@@ -941,17 +945,23 @@ def main():
         train_loss_fn = nn.CrossEntropyLoss()
     train_loss_fn = train_loss_fn.to(device=device)
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
-    if args.Disfn=='CE':
+    if args.klloss_weight==0.0:
+        kl_criterion =  None
+    elif args.Disfn=='CE':
         kl_criterion =  DistillCE().to(device=device)
     elif args.Disfn=='cos':
         kl_criterion =  DistillCosSim(args.top_k).to(device=device)
     elif args.Disfn=='klandcos':
         kl_criterion =  DistillKLandCosSim(args.T).to(device=device)
     elif args.Disfn=='DKD':
+        # kl_criterion = DKD(args.T, alpha=0.2, beta=1.8).to(device=device)
         kl_criterion = DKD(args.T, alpha=0.5, beta=1.5).to(device=device)
     else:   
         kl_criterion =  DistillKL(args.T).to(device=device)
-    if args.FLfn=='KL':
+
+    if args.featureloss_weight ==0:
+        feature_criterion =  None
+    elif args.FLfn=='KL':
         print('======================================================================================================using KL loss for feature loss calculation')
         feature_criterion =  FeatureLossKL(reduction=args.featureloss_reduction).to(device=device)
     elif args.FLfn=='cos':
@@ -1159,7 +1169,8 @@ def train_one_epoch(
     losses_feature_m = utils.AverageMeter()
 
     model.train()
-    teacher_model.eval()
+    if teacher_model:
+        teacher_model.eval()
 
     accum_steps = args.grad_accum_steps
     last_accum_steps = len(loader) % accum_steps
@@ -1174,8 +1185,9 @@ def train_one_epoch(
 
     if loader_init and not args.resume:
         for batch_idx, (input, target) in enumerate(loader_init):
-            with torch.no_grad():
-                teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
+            if teacher_model:
+                with torch.no_grad():
+                    teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
             if args.vqtype == 'vq' and args.kmeans_init_code:
                 init_codebook(model,init_feat_list)
             elif args.vqtype == 'fsq' and args.init_fsqt:
@@ -1201,16 +1213,22 @@ def train_one_epoch(
 
         def _forward():
             with amp_autocast():
-                with torch.no_grad():
-                    teacher_output, teacher_feat = teacher_model(input,is_feat=True)
+                if teacher_model:
+                    with torch.no_grad():
+                        teacher_output, teacher_feat = teacher_model(input,is_feat=True)
                 output, dict_loss, feat = model(input,is_feat=True)
                 loss = loss_fn(output, target) * args.celoss_weight
                 loss_dict = dict_loss * args.dictloss_weight
-                if isinstance(kl_criterion, DKD):
+                if not kl_criterion:
+                    loss_kl = torch.tensor(0.0).to(device)
+                elif isinstance(kl_criterion, DKD):
                     loss_kl =  kl_criterion(output, teacher_output.detach(), target) * args.klloss_weight
                 else:
                     loss_kl =  kl_criterion(output, teacher_output.detach()) * args.klloss_weight
-                loss_feature = feature_criterion(feat,teacher_feat) *args.featureloss_weight
+                if not feature_criterion:
+                    loss_feature = torch.tensor(0.0).to(device)
+                else:
+                    loss_feature = feature_criterion(feat,teacher_feat) *args.featureloss_weight
                 sum_loss = [loss , loss_dict ,loss_kl, loss_feature]
             return sum_loss
 
