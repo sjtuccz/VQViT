@@ -185,6 +185,33 @@ def fix_exact_params(params: int, model: torch.nn.Module) -> int:
         return params - total_reduction
     else:
         return params
+    
+def cal_qkvMatDot_FLOPs(batch=1,head_num=6,seq_len=197,dim=384,block_num=12):
+    
+    '''
+    x = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
+    or
+
+    q = q * self.scale
+    attn = q @ k.transpose(-2, -1) # b h n d @ b h d n
+    attn = attn.softmax(dim=-1)
+    x = attn @ v   # b h n n @ b h n d
+
+    This code cannot be automatically calculated for FLOPs by these packages: ptflops calflops ptflops  fvcore thop
+    
+    vit-s-16: q,k,v.shape=(1,6,197,64) (b,h_num,seq_len,head_dim) (b,h,n,d)
+
+    '''
+    b=batch
+    h = head_num
+    n = seq_len
+    d=dim//head_num
+    FLOPs= block_num*(b*h*n*d + (2*d-1)*n*n*b*h + 3*b*h*n*n-1 + (2*n-1)*n*d*b*h)
+    return format_param_count(FLOPs)
+
 def format_param_count(param_count, decimal_places=2):
     if param_count >= 1e9:
         return f"{round(param_count / 1e9, decimal_places)}B" 
@@ -350,7 +377,6 @@ def validate(args):
             input = input.contiguous(memory_format=torch.channels_last)
         with amp_autocast():
             model(input)
-
         end = time.time()
         for batch_idx, (input, target) in enumerate(loader):
             if args.no_prefetcher:
@@ -376,7 +402,6 @@ def validate(args):
             losses.update(loss.item(), input.size(0))
             top1.update(acc1.item(), input.size(0))
             top5.update(acc5.item(), input.size(0))
-
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -431,7 +456,10 @@ def validate(args):
         average_batchtime = f'{batch_time.avg:.3f}s, {input.size(0) / batch_time.avg:>7.2f}/s'
         
     )
-
+    
+    # from torchstat import stat
+    # model = model.cpu().eval()
+    # stat(model, (3, 224, 224))
     # _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
     #    results['top1'], results['top1_err'], results['top5'], results['top5_err']))
 

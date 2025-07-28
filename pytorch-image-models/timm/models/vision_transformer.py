@@ -81,6 +81,7 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
+        # print(q.shape, k.shape, v.shape)
         q, k = self.q_norm(q), self.k_norm(k)
 
         if self.fused_attn:
@@ -726,6 +727,7 @@ class VisionTransformer(nn.Module):
         # x = self.forward_features(x,is_feat)
         x = self.patch_embed(x)
         x = self._pos_embed(x)
+        # print("x.shape",x.shape)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
         # if self.grad_checkpointing and not torch.jit.is_scripting():

@@ -203,13 +203,14 @@ class FSQ_T(nn.Module):
             unique_index=torch.unique(indices)
             num_feature = z.shape[0] * z.shape[1]
             print(f"ActivatedCode:{unique_index.shape[0]}, NumFeature: {num_feature}, CodebookSize: {self.codebook_size}, QuantiError: {quantization_error}")
+        
         if not self.training and self.is_pre_cal:
             indices = self.codes_to_indices(codes)
             return indices
         else:
             z_q = self.expand(codes)
-            return z_q , quantization_error
-            # return z_q , torch.tensor(0.0).cuda()
+            # return z_q , quantization_error
+            return z_q , torch.tensor(0.0).cuda()
     
     def indices_to_level_indices(self, indices):
         """ Converts indices to indices at each level, perhaps needed for a transformer with factorized embeddings """
@@ -426,6 +427,8 @@ class FSQ_trainableT(nn.Module):
 
         self.compress = nn.Linear(channels_in, channels_dim)
         self.expand = nn.Linear(channels_dim, channels_in)
+        # self.compress = nn.Linear(channels_in, channels_dim, bias=False)
+        # self.expand = nn.Linear(channels_dim, channels_in, bias=False)
         assert len(levels) == channels_dim
         self.codebook_dim = len(levels)
         # self._levels = torch.tensor(levels, dtype=torch.int32)
@@ -447,14 +450,14 @@ class FSQ_trainableT(nn.Module):
         self.is_pre_cal = False
 
     def get_T(self):
-        # 后续可以改进该部分代码，在推理阶段直接获取T_sigmoid，不要重复计算。
+        # 后续可以改进该部分代码，在推理阶段直接获取T_softplus，不要重复计算。
         # Sigmoid映射到[T_min, T_max]
-        # T_sigmoid =  self.T_max * torch.sigmoid(self.T_raw)
-        # T_sigmoid = self.T_min + (self.T_max - self.T_min) * torch.sigmoid(self.T_raw)
-        T_sigmoid =  F.softplus(self.T_raw) 
-        if random.random() < 0.0001:
-            print(f"FSQ T_sigmoid: {T_sigmoid}")
-        return T_sigmoid
+        # T_softplus =  self.T_max * torch.sigmoid(self.T_raw)
+        # T_softplus = self.T_min + (self.T_max - self.T_min) * torch.sigmoid(self.T_raw)
+        T_softplus =  F.softplus(self.T_raw) 
+        # if random.random() < 0.0001:
+        #     print(f"FSQ T_softplus: {T_softplus}")
+        return T_softplus
     
     def reparameterize(self):
         print('using FSQ_trainableT reparameterize')
@@ -463,6 +466,8 @@ class FSQ_trainableT(nn.Module):
         # implicit_codebook = torch.tensor(implicit_codebook).to(self.expand.weight.device)
         expand_dict = self.expand(implicit_codebook)
         del self.expand
+        self.register_buffer("T_softplus", self.get_T())
+        del self.T_raw
         return expand_dict
     
     def forward(self, z):
@@ -474,12 +479,8 @@ class FSQ_trainableT(nn.Module):
 
         input = z
         z = self.compress(z) # (b, h , dim)
-        # print(f"z shape: {z.shape}")
         codes = self.quantize(z) # 输出范围(-T,T)
-        # quantization_error = torch.mean((z-codes)**2)
         quantization_error = torch.mean((z-codes.detach())**2)
-        # codes  = codes.detach()+z-z.detach()
-        # if quantization_error>1.0:
         if rand < 0.0005:
             # analyze_tensor(input, name="input")
             # analyze_tensor(z, name="compress")
@@ -487,8 +488,8 @@ class FSQ_trainableT(nn.Module):
             indices = self.codes_to_indices(codes)
             unique_index=torch.unique(indices)
             num_feature = z.shape[0] * z.shape[1]
-            print(f"ActivatedCode:{unique_index.shape[0]}, NumFeature: {num_feature}, CodebookSize: {self.codebook_size}, QuantiError: {quantization_error}")
-        # quantization_error = (z - codes).abs().mean()
+            print(f"NumFeature: {num_feature}, CodebookSize: {self.codebook_size}, QuantiError: {quantization_error}")
+            # print(f"index: {unique_index}, ActivatedCode:{unique_index.shape[0]}, NumFeature: {num_feature}, CodebookSize: {self.codebook_size}, QuantiError: {quantization_error}")
         
         if not self.training and self.is_pre_cal:
             indices = self.codes_to_indices(codes)
@@ -506,8 +507,10 @@ class FSQ_trainableT(nn.Module):
 
     def _scale_and_shift_inverse(self, zhat):
         half_width = self._levels // 2
-        T_sigmoid = self.get_T()
-        return (zhat - half_width) / half_width *T_sigmoid
+        if not self.training and self.is_pre_cal:
+            return (zhat - half_width) / half_width *self.T_softplus
+        else:
+            return (zhat - half_width) / half_width *self.get_T()
 
     def _indices_to_codes(self, indices):
         level_indices = self.indices_to_level_indices(indices)
@@ -516,8 +519,9 @@ class FSQ_trainableT(nn.Module):
     
     def _scale_and_shift(self, zhat_normalized):
         half_width = self._levels // 2
-        T_sigmoid = self.get_T()
-        return (zhat_normalized / T_sigmoid * half_width) + half_width
+        if not self.training and self.is_pre_cal:
+            return (zhat_normalized / self.T_softplus * half_width) + half_width
+        return (zhat_normalized / self.get_T() * half_width) + half_width
     
     def codes_to_indices(self, zhat):
         """ Converts a `code` to an index in the codebook. """
@@ -537,16 +541,21 @@ class FSQ_trainableT(nn.Module):
         half_l = ((self._levels - 1) * (1 + eps) / 2)
         offset = torch.where(self._levels % 2 == 0, 0.5, 0.0).to(z.device)
         shift = torch.atanh(offset / half_l)
-        T_sigmoid = self.get_T()
-        z_bound = torch.tanh(z/T_sigmoid + shift) * half_l - offset
+        if not self.training and self.is_pre_cal:
+            z_bound = torch.tanh(z/self.T_softplus + shift) * half_l - offset
+        else:
+            z_bound = torch.tanh(z/self.get_T() + shift) * half_l - offset
         return z_bound
     
     def quantize(self, z):
+        # print("z shape :",z.shape)
         """ Quantizes z, returns quantized zhat, same shape as z. """
         quantized = self.round_ste(self.bound(z)).to(z.device)
         half_width = (self._levels // 2).to(z.device)# Renormalize to [-T, T].
-        T_sigmoid = self.get_T()
-        return quantized / half_width * T_sigmoid
+        if not self.training and self.is_pre_cal:
+            return quantized / half_width * self.T_softplus
+        return quantized / half_width * self.get_T()
+        
     
 class FSQ_AdaptiveQuant(nn.Module):
     def __init__(self, n_e, channels_in, channels_dim, levels=[15,15,15], bandwidth=0.5):

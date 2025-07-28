@@ -190,15 +190,22 @@ class FeatureLossCosineKL(nn.Module):
             raise ValueError("Reduction must be 'mean' or 'sum'.")
         
 
+# def _get_gt_mask(logits, target):
+#     target = target.reshape(-1).long()
+#     mask = torch.zeros_like(logits).scatter_(1, target.unsqueeze(1), 1).bool()
+#     return mask
 def _get_gt_mask(logits, target):
-    target = target.reshape(-1).long()
-    mask = torch.zeros_like(logits).scatter_(1, target.unsqueeze(1), 1).bool()
+    assert target.dim() == 2, "Target must be 2D (batch, seq_len)"
+    mask = (target != 0)
     return mask
 
 
+# def _get_other_mask(logits, target):
+#     target = target.reshape(-1)
+#     mask = torch.ones_like(logits).scatter_(1, target.unsqueeze(1), 0).bool()
+#     return mask
 def _get_other_mask(logits, target):
-    target = target.reshape(-1)
-    mask = torch.ones_like(logits).scatter_(1, target.unsqueeze(1), 0).bool()
+    mask = (target == 0)
     return mask
 
 
@@ -221,8 +228,8 @@ class DKD(nn.Module):
 
     def forward(self, logits_student, logits_teacher, target):
         # print(f'target: {target}, shape:{target.shape}')
-        if target.dim() == 2:
-            target = torch.argmax(target, dim=1) 
+        if target.dim() == 1:
+            target = F.one_hot(target.long(), num_classes=1000).float()
         gt_mask = _get_gt_mask(logits_student, target)
         other_mask = _get_other_mask(logits_student, target)
         pred_student = F.softmax(logits_student / self.temperature , dim=1)
