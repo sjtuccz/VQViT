@@ -1,9 +1,8 @@
 # VQViT
 under revision.......
 
-This repository contains the official implementation of VQVIT, an ICLR Workshop 2023 paper. This model is aimed at detection tasks in the low-data regimes and achieves SoTA results on CIFAR-100, Tiny Imagenet, and science tasks like Galaxy10 DECals, and competetive performance on CIFAR-10 _without any additional labelled or unlabelled data_.
 
-_**Accompanying paper: [Astroformer: More Data Might not be all you need for Classification](https://arxiv.org/abs/2304.05350)**_ [![arXiv](https://img.shields.io/badge/paper-arXiv:2304.05350-b31b1b.svg?logo=arxiv)](https://arxiv.org/abs/2304.05350)
+_**Accompanying paper: 
 
 ## Code Overview
 
@@ -50,29 +49,26 @@ You could use the same script with the other VQViT models : `--model` `vqvit_sma
 
 ## Main Results
 
+### Imagenet-1K
+
+| Model Name   | Top-1 Accuracy | FLOPs | Params |
+|--------------|----------------|-------|--------|
+
 ### CIFAR-100
 
 | Model Name   | Top-1 Accuracy | FLOPs | Params |
 |--------------|----------------|-------|--------|
-| -3| 87.65          | 31.36 | 161.95 |
-| Astroformer-4| 93.36          | 60.54 | 271.68 |
-| Astroformer-5| 89.38          | 115.97| 655.34 |
+
 
 ### CIFAR-10
 
 | Model Name   | Top-1 Accuracy | FLOPs | Params |
 |--------------|----------------|-------|--------|
-| Astroformer-3| 99.12          | 31.36 | 161.75 |
-| Astroformer-4| 98.93          | 60.54 | 271.54 |
-| Astroformer-5| 93.23          | 115.97| 655.04 |
 
 ### Tiny Imagenet
 
 | Model Name   | Top-1 Accuracy | FLOPs | Params |
 |--------------|----------------|-------|--------|
-| Astroformer-3| 86.86          | 24.84 | 150.39 |
-| Astroformer-4| 91.12          | 40.38 | 242.58 |
-| Astroformer-5| 92.98          | 89.88 | 595.55 |
 
 ## Citation
 
