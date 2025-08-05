@@ -1,40 +1,18 @@
 #!/usr/bin/env python3
-""" VQ-ViT Training Script
-Rewritten from the train.py script of the timm library
+""" ImageNet Training Script
 
-for example:
-CUDA_VISIBLE_DEVICES=1 python trainvq.py -j 16 
---vqtype tfsq 
---dict-dim 4
---fsq-level 3 3 3 3
---FLfn cos 
---Disfn DKD 
---klloss-weight 4.0 
---featureloss-weight 0.0 
---model vqvit_tiny_patch16_224 
---teacher-model vit_tiny_patch16_224 
---output  
---dataset imagenet1k 
---data-dir 
---initial-checkpoint  
---input-size 3 224 224  
---sched cosine  
---min-lr 1e-5 
---warmup-lr 1e-5 
---epochs 400 
---warmup-epochs 5 
---drop 0.0 
---amp 
---cooldown-epochs 10 
---featureloss-reduction sum 
---dictloss-weight 1.0 
---clip-grad 600.0 
---T 1.0 
---scale 0.5 1.0  
---mixup 0.0 --cutmix 0.0 --smoothing 0.0 --drop-path 0.0 
--b 1024 --grad-accum-steps 4  
---lr 4e-4 --opt adamw --weight-decay 0.1 
---model-kwargs fsq_Tinit=-1
+This is intended to be a lean and easily modifiable ImageNet training script that reproduces ImageNet
+training results with some of the latest networks and training techniques. It favours canonical PyTorch
+and standard Python style over trying to be able to 'do it all.' That said, it offers quite a few speed
+and training result improvements over the usual PyTorch example scripts. Repurpose as you see fit.
+
+This script was started from an early version of the PyTorch ImageNet example
+(https://github.com/pytorch/examples/tree/master/imagenet)
+
+NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
+(https://github.com/NVIDIA/apex/tree/master/examples/imagenet)
+
+Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import argparse
 import logging
@@ -127,12 +105,12 @@ group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
 
 # Model parameters
 group = parser.add_argument_group('Model parameters')
-group.add_argument('--model', default='vit_small_patch32_224', type=str, metavar='MODEL',
+group.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
                    help='Name of model to train (default: "resnet50")')
 
-group.add_argument('--vqtype', default='tfsq', type=str, metavar='VQ',
+group.add_argument('--vqtype', default='vq', type=str, metavar='VQ',
                    help='vqtype: vq or fsq')
-group.add_argument('--fsq-level', type=int, nargs='+', default=[3,3,3,3], metavar='FSQLEVEL',
+group.add_argument('--fsq-level', type=int, nargs='+', default=[7,7,7], metavar='FSQLEVEL',
                    help='fsq level')
 
 group.add_argument('--kmeans-init-code', action='store_true', default=False,
@@ -181,7 +159,7 @@ group.add_argument('--std', type=float, nargs='+', default=None, metavar='STD',
                    help='Override std deviation of dataset')
 group.add_argument('--interpolation', default='', type=str, metavar='NAME',
                    help='Image resize interpolation type (overrides model)')
-group.add_argument('-b', '--batch-size', type=int, default=1024, metavar='N',
+group.add_argument('-b', '--batch-size', type=int, default=128, metavar='N',
                    help='Input batch size for training (default: 128)')
 group.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                    help='Validation batch size override (default: None)')
@@ -234,10 +212,10 @@ parser.add_argument('--top-k', type=int, default=None,
                     help='top k for distillation cos sim loss')
 parser.add_argument('--dictloss-weight', type=float, default=1.0, help='dic loss weight')
 parser.add_argument('--celoss-weight', type=float, default=1.0, help='loss weight')
-parser.add_argument('--klloss-weight', type=float, default=4.0, help='kl loss weight')
-parser.add_argument('--FLfn', default='cos', type=str, metavar='FLossFunc',
+parser.add_argument('--klloss-weight', type=float, default=1.0, help='kl loss weight')
+parser.add_argument('--FLfn', default='L2', type=str, metavar='FLossFunc',
                     help='type of feature loss func (default: L2) One of ("L2", "KL", "")')
-parser.add_argument('--Disfn', default='DKD', type=str, metavar='DIStillLossFunc',
+parser.add_argument('--Disfn', default='KL', type=str, metavar='DIStillLossFunc',
                     help='type of distillation loss func (default: KlDiv) One of ("CE", "KL", "")')
 parser.add_argument('--featureloss-weight', type=float, default=2.0, help='feature loss weight')
 parser.add_argument('--featureloss-reduction', default='mean', type=str, metavar='POOL',
@@ -275,9 +253,9 @@ group.add_argument('--lr-k-decay', type=float, default=1.0,
                    help='learning rate k-decay for cosine/poly (default: 1.0)')
 group.add_argument('--warmup-lr', type=float, default=1e-5, metavar='LR',
                    help='warmup learning rate (default: 1e-5)')
-group.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
+group.add_argument('--min-lr', type=float, default=1e-7, metavar='LR',
                    help='lower lr bound for cyclic schedulers that hit 0 (default: 0)')
-group.add_argument('--epochs', type=int, default=360, metavar='N',
+group.add_argument('--epochs', type=int, default=500, metavar='N',
                    help='number of epochs to train (default: 300)')
 group.add_argument('--epoch-repeats', type=float, default=0., metavar='N',
                    help='epoch repeat multiplier (number of times to repeat dataset epoch per train epoch).')
@@ -569,21 +547,25 @@ def main():
         in_chans = args.input_size[0]
 
     if 'cifar100' in args.dataset:
+        # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/'
         args.data_dir = '../../pytorch-cifar100-master/data/' if not args.data_dir else args.data_dir
         args.mean = CIFAR100_TRAIN_MEAN
         args.std = CIFAR100_TRAIN_STD
         args.num_classes = 100
     elif 'cifar10' in args.dataset:
+        # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/cifar10download/'
         args.data_dir = '../../pytorch-cifar100-master/data/cifar10download/' if not args.data_dir else args.data_dir
         args.mean = CIFAR10_MEAN
         args.std = CIFAR10_STD
         args.num_classes = 10
     elif 'tiny-imagenet' in args.dataset:
         args.data_dir = '../../tiny-imagenet-200/' if not args.data_dir else args.data_dir
+        # args.data_dir = '/mnt/ccz/tiny-imagenet-200/'
         args.mean = IMAGENET_DEFAULT_MEAN #TINY_IMAGENET_MEAN
         args.std = IMAGENET_DEFAULT_STD #TINY_IMAGENET_STD
         args.num_classes = 200
     elif 'imagenet1k' in args.dataset:
+        # args.data_dir = '/mnt/ccz/ImageNet2012/'
         args.data_dir = '../../ImageNet2012/' if not args.data_dir else args.data_dir
         args.mean = IMAGENET_DEFAULT_MEAN
         args.std = IMAGENET_DEFAULT_STD
@@ -621,6 +603,13 @@ def main():
     )
     if args.shared_codebook:
         model.use_shared_codebook()
+
+    # def freeze_attn_layers_but_keep_grad(model):
+    #     print("freeze MHA")
+    #     for name, param in model.named_parameters():
+    #         if 'attn' in name:
+    #             param.requires_grad = False 
+    # freeze_attn_layers_but_keep_grad(model)
 
     def freeze_but_keep_VQ_grad(model):
         print("freeze VQ Block")
@@ -973,10 +962,13 @@ def main():
     if args.featureloss_weight ==0:
         feature_criterion =  None
     elif args.FLfn=='KL':
+        print('======================================================================================================using KL loss for feature loss calculation')
         feature_criterion =  FeatureLossKL(reduction=args.featureloss_reduction).to(device=device)
     elif args.FLfn=='cos':
+        print('using cos loss for feature loss calculation')
         feature_criterion =  FeatureLossCosine(reduction=args.featureloss_reduction).to(device=device)
     elif args.FLfn=='klcos':
+        print('using cos and KL loss separately for feature distillation loss calculation')
         feature_criterion =  FeatureLossCosineKL(reduction=args.featureloss_reduction).to(device=device)
     else:
         feature_criterion =  FeatureLossL2(reduction=args.featureloss_reduction).to(device=device)

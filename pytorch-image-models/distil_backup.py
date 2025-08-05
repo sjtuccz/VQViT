@@ -1,49 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-class DKD(nn.Module):
-    def __init__(self, T=1.0, alpha=1.0, beta=1.0):
-        super(DKD, self).__init__()
-        print(f'using DKD divergence loss T={T} for logits distillation')
-        self.alpha = alpha
-        self.beta = beta
-        self.temperature = T
-        # self.warmup = cfg.DKD.WARMUP
-        # self.logit_stand = cfg.EXPERIMENT.LOGIT_STAND
-        # self.trainer = cfg.SOLVER.TRAINER
-        # self.topk = cfg.SOLVER.DEEPKD.TOPK
-
-    def forward(self, logits_student, logits_teacher, target):
-        # print(f'target: {target}, shape:{target.shape}')
-        if target.dim() == 1:
-            target = F.one_hot(target.long(), num_classes=1000).float()
-        gt_mask = _get_gt_mask(logits_student, target)
-        other_mask = _get_other_mask(logits_student, target)
-        pred_student = F.softmax(logits_student / self.temperature , dim=1)
-        pred_teacher = F.softmax(logits_teacher / self.temperature , dim=1)
-        pred_student = cat_mask(pred_student, gt_mask, other_mask)
-        pred_teacher = cat_mask(pred_teacher, gt_mask, other_mask)
-        log_pred_student = torch.log(pred_student)
-        tckd_loss = (
-            F.kl_div(log_pred_student, pred_teacher, reduction='sum')
-            * (self.temperature **2)
-            / target.shape[0]
-        )
-        pred_teacher_part2 = F.softmax(
-            logits_teacher / self.temperature  - 1000.0 * gt_mask, dim=1
-        )
-        log_pred_student_part2 = F.log_softmax(
-            logits_student / self.temperature  - 1000.0 * gt_mask, dim=1
-        )
-        nckd_loss = (
-            F.kl_div(log_pred_student_part2, pred_teacher_part2, reduction='sum')
-            * (self.temperature **2)
-            / target.shape[0]
-        )
-        return self.alpha * tckd_loss + self.beta * nckd_loss
-
-
 class DistillKL(nn.Module):
     """Distilling the Knowledge in a Neural Network"""
     def __init__(self, T,dim=1):
@@ -113,6 +70,7 @@ class FeatureLossL2(nn.Module):
         super(FeatureLossL2, self).__init__()
         self.reduction = reduction  # 选择损失的计算方式
 
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     def forward(self, fstudent, fteacher):
         # fstudent = fstudent[1:-4]
         # fteacher = fteacher[1:-4]
@@ -141,11 +99,15 @@ class FeatureLossKL(nn.Module):
         super(FeatureLossKL, self).__init__()
         self.reduction = reduction  # 选择损失的计算方式
         self.kl = DistillKL(T=1.0,dim=-1)
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     def forward(self, fstudent, fteacher):
         # fstudent = fstudent[-5:]
         # fteacher = fteacher[-5:]
         loss_all = 0.0
         for idx, (fs, ft) in enumerate(zip(fstudent, fteacher)):
+            if idx==8:
+                continue
             # 确保特征维度一致
             if isinstance(fs, (list, tuple)) or isinstance(ft, (list, tuple)):
                 for s, t in zip(fs, ft):
@@ -169,6 +131,14 @@ class FeatureLossCosine(nn.Module):
         # self.choose_feat = [3, 5, 7,9,11]  
 
     def forward(self, fstudent, fteacher):
+        """
+        计算学生特征与教师特征之间的余弦相似度损失
+        Args:
+            fstudent: 学生网络的多层特征列表 [Tensor1, Tensor2, ...]
+            fteacher: 教师网络的多层特征列表 [Tensor1, Tensor2, ...]
+        Returns:
+            余弦相似度损失（标量）
+        """
         loss_all = 0.0
         for idx, (fs, ft) in enumerate(zip(fstudent, fteacher)):
             # if idx not in self.choose_feat:
@@ -244,3 +214,43 @@ def cat_mask(t, mask1, mask2):
     t2 = (t * mask2).sum(1, keepdims=True)
     rt = torch.cat([t1, t2], dim=1)
     return rt
+class DKD(nn.Module):
+    def __init__(self, T=1.0, alpha=1.0, beta=1.0):
+        super(DKD, self).__init__()
+        print(f'using DKD divergence loss T={T} for logits distillation')
+        self.alpha = alpha
+        self.beta = beta
+        self.temperature = T
+        # self.warmup = cfg.DKD.WARMUP
+        # self.logit_stand = cfg.EXPERIMENT.LOGIT_STAND
+        # self.trainer = cfg.SOLVER.TRAINER
+        # self.topk = cfg.SOLVER.DEEPKD.TOPK
+
+    def forward(self, logits_student, logits_teacher, target):
+        # print(f'target: {target}, shape:{target.shape}')
+        if target.dim() == 1:
+            target = F.one_hot(target.long(), num_classes=1000).float()
+        gt_mask = _get_gt_mask(logits_student, target)
+        other_mask = _get_other_mask(logits_student, target)
+        pred_student = F.softmax(logits_student / self.temperature , dim=1)
+        pred_teacher = F.softmax(logits_teacher / self.temperature , dim=1)
+        pred_student = cat_mask(pred_student, gt_mask, other_mask)
+        pred_teacher = cat_mask(pred_teacher, gt_mask, other_mask)
+        log_pred_student = torch.log(pred_student)
+        tckd_loss = (
+            F.kl_div(log_pred_student, pred_teacher, reduction='sum')
+            * (self.temperature **2)
+            / target.shape[0]
+        )
+        pred_teacher_part2 = F.softmax(
+            logits_teacher / self.temperature  - 1000.0 * gt_mask, dim=1
+        )
+        log_pred_student_part2 = F.log_softmax(
+            logits_student / self.temperature  - 1000.0 * gt_mask, dim=1
+        )
+        nckd_loss = (
+            F.kl_div(log_pred_student_part2, pred_teacher_part2, reduction='sum')
+            * (self.temperature **2)
+            / target.shape[0]
+        )
+        return self.alpha * tckd_loss + self.beta * nckd_loss

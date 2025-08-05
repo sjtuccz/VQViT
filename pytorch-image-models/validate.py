@@ -66,7 +66,7 @@ parser.add_argument('--dataset-download', action='store_true', default=False,
                     help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
 parser.add_argument('--model', '-m', metavar='NAME', default='dpn92',
                     help='model architecture (default: dpn92)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=16, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
@@ -127,7 +127,7 @@ parser.add_argument('--fuser', default='', type=str,
 parser.add_argument('--fast-norm', default=False, action='store_true',
                     help='enable experimental fast-norm')
 parser.add_argument('--reparam', default=False, action='store_true',
-                    help='Reparameterize model')
+                    help='token-reparameterize model')
 parser.add_argument('--model-kwargs', nargs='*', default={}, action=ParseKwargs)
 
 
@@ -200,16 +200,16 @@ def cal_qkvMatDot_FLOPs(batch=1,head_num=6,seq_len=197,dim=384,block_num=12):
     attn = attn.softmax(dim=-1)
     x = attn @ v   # b h n n @ b h n d
 
-    This code cannot be automatically calculated for FLOPs by these packages: ptflops calflops ptflops  fvcore thop
+    This code cannot be automatically calculated for FLOPs by these packages: ptflops calflops ptflops fvcore thop
     
-    vit-s-16: q,k,v.shape=(1,6,197,64) (b,h_num,seq_len,head_dim) (b,h,n,d)
+    e.g., vit-s-16: q,k,v.shape=(1,6,197,64) (b,h_num,seq_len,head_dim) (b,h,n,d)
 
     '''
     b=batch
     h = head_num
     n = seq_len
     d=dim//head_num
-    FLOPs= block_num*(b*h*n*d + (2*d-1)*n*n*b*h + 3*b*h*n*n-1 + (2*n-1)*n*d*b*h)
+    FLOPs= 0.5*block_num*(b*h*n*d + (2*d-1)*n*n*b*h + 3*b*h*n*n-1 + (2*n-1)*n*d*b*h)
     return format_param_count(FLOPs)
 
 def format_param_count(param_count, decimal_places=2):
@@ -497,25 +497,21 @@ def main():
     args = parser.parse_args()
 
     if 'cifar100' in args.dataset:
-        # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/'
         args.data_dir = '../../pytorch-cifar100-master/data/' if not args.data_dir else args.data_dir
         args.mean = CIFAR100_TRAIN_MEAN
         args.std = CIFAR100_TRAIN_STD
         args.num_classes = 100
     elif 'cifar10' in args.dataset:
-        # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/cifar10download/'
-        args.data_dir = '/home/mulan/ccz/pytorch-cifar100-master/data/cifar10download/' if not args.data_dir else args.data_dir
+        args.data_dir = '../../pytorch-cifar100-master/data/cifar10download/' if not args.data_dir else args.data_dir
         args.mean = CIFAR10_MEAN
         args.std = CIFAR10_STD
         args.num_classes = 10
     elif 'tiny-imagenet' in args.dataset:
         args.data_dir = '../../tiny-imagenet-200/' if not args.data_dir else args.data_dir
-        # args.data_dir = '/mnt/ccz/tiny-imagenet-200/'
         args.mean = IMAGENET_DEFAULT_MEAN #TINY_IMAGENET_MEAN
         args.std = IMAGENET_DEFAULT_STD #TINY_IMAGENET_STD
         args.num_classes = 200
     elif 'imagenet1k' in args.dataset:
-        # args.data_dir = '/mnt/ccz/ImageNet2012/'
         args.data_dir = '../../ImageNet2012/' if not args.data_dir else args.data_dir
         args.mean = IMAGENET_DEFAULT_MEAN
         args.std = IMAGENET_DEFAULT_STD
