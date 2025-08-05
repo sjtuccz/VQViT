@@ -1,14 +1,18 @@
 # Supplementary materials
 
-VQ-ViT: Accelerating Vision Transformer via Token-wise Reparametrization
 
 Note: The Reproducibility Checklist was not attached at the end of the main text. It has been added in this supplementary material.
+
+**VQViT-main.zip contains all the code for the paper "VQ-ViT: Accelerating Vision Transformer via Token-wise Reparametrization".**
+
+**We have isolated several key code files separately: vision_transformer_vq.py , trainvq.py , distill.py , validate.py , _factory.py , vectorquantize.py , _factory.py.**
 
 ## Code Overview
 
  We trained VQ-ViT using the `timm` framework. Inside `pytorch-image-models`, we have made the following modifications. (Though one could look at the diff, we think it is convenient to summarize them here.)
 
 - added `timm/models/vision_transformer_vq.py`: VQ-ViT model
+- added `timm/models/vectorquantize.py` : Vector quantization Block (VQ block), used in `vision_transformer_vq.py`
 - added `trainvq.py`: training script for VQ-ViT
 - added `distill.py` : distillation method for VQ-ViT, used in `trainvq.py`
 - modified `validate.py`: for the validation of token-wise reparameterized VQVIT
