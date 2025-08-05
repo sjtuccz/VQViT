@@ -3,7 +3,6 @@
 VQ-ViT: Accelerating Vision Transformer via Token-wise Reparametrization
 
 Note: The Reproducibility Checklist was not attached at the end of the main text. It has been added in this supplementary material.
-_**Accompanying paper: 
 
 ## Code Overview
 
