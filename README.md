@@ -1,6 +1,11 @@
 # Supplementary materials
 
+<<<<<<< HEAD
 VQ-ViT: Accelerating Vision Transformer via Token-wise Reparametrization
+=======
+
+_**Accompanying paper: 
+>>>>>>> a0303df581b06ea853a862e0f96270157dcff69e
 
 Note: The Reproducibility Checklist was not attached at the end of the main text. It has been added in this supplementary material.
 ## Code Overview
@@ -52,9 +57,27 @@ On CIFAR:
 CUDA_VISIBLE_DEVICES=0 python trainvq.py -j 28 --vqtype tfsq --dict-dim 3 --fsq-level 3 3 3 --FLfn cos --Disfn DKD --klloss-weight 4.0 --featureloss-weight 1.0 --model vqvit_small_patch16_224 --teacher-model vit_small_patch16_224 --output /path/VQViT/output/in1k --dataset imagenet1k --data-dir /path/imagenet1k --initial-checkpoint /path/vit_small_patch16_224/model_best.pth.tar --input-size 3 224 224  --sched cosine  --min-lr 1e-6 --warmup-lr 1e-5 --epochs 200 --warmup-epochs 5 --drop 0.0 --amp --cooldown-epochs 10 --featureloss-reduction sum --dictloss-weight 1.0 --clip-grad 600.0 --T 1.0 --scale 0.7 1.0  --mixup 0.0 --cutmix 0.0 --smoothing 0.0 --drop-path 0.0 -b 128 --grad-accum-steps 1  --lr 1.5e-4 --opt adamw --weight-decay 0.04 --model-kwargs fsq_Tmax=3  fsq_Tinit=-1 
 ```
 
+<<<<<<< HEAD
+=======
+You could use the same script with the other VQViT models : `--model` `vqvit_small_patch16_224`, `vqvit_base_patch16_224`, `vqvit_small_patch32_224` and modify the corresponding teacher models：`--teacher-model` `vit_small_patch16_224`, `vit_base_patch16_224`, `vit_small_patch32_224` .When selecting a dataset, specify the dataset location in the command or script.  `--dataset` `torch/cifar100`,`tiny-imagenet`
+
+## Main Results
+
+### Imagenet-1K
+
+| Model Name   | Top-1 Accuracy | FLOPs | Params |
+|--------------|----------------|-------|--------|
+
+### CIFAR-100
+
+| Model Name   | Top-1 Accuracy | FLOPs | Params |
+|--------------|----------------|-------|--------|
+
+>>>>>>> a0303df581b06ea853a862e0f96270157dcff69e
 
  You could validate a VQViT as follows:
 
+<<<<<<< HEAD
  Please note that the *--reparam* option will perform token reparameterization on VQ-ViT, corresponding to the "inference phase" architecture in the text.
 
 On ImageNet-1k:
@@ -70,6 +93,29 @@ then, you will get:
     "param_count": "12.36M",
     "FLOPs": "2.159G", #The FLOPs result does not include the matrix multiplication of attention. Please manually add it. For details, please refer to the function cal_qkvMatDot_FLOPs at line 189 of validate.py.
     "average_batchtime": "0.101s,    9.95/s"
+=======
+| Model Name   | Top-1 Accuracy | FLOPs | Params |
+|--------------|----------------|-------|--------|
+
+### Tiny Imagenet
+
+| Model Name   | Top-1 Accuracy | FLOPs | Params |
+|--------------|----------------|-------|--------|
+
+## Citation
+
+If you use this work, please cite the following paper:
+
+BibTeX:
+
+```bibtex
+@article{,
+  title={},
+  author={},
+  journal={},
+  year={}
+}
+>>>>>>> a0303df581b06ea853a862e0f96270157dcff69e
 ```
 
 On CIFAR:
