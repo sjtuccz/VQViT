@@ -202,8 +202,10 @@ def cal_qkvMatDot_FLOPs(batch=1,head_num=6,seq_len=197,dim=384,block_num=12):
 
     This code cannot be automatically calculated for FLOPs by these packages: ptflops calflops ptflops fvcore thop
     
-    e.g., vit-s-16: q,k,v.shape=(1,6,197,64) (b,h_num,seq_len,head_dim) (b,h,n,d)
-
+    (vq)vit-t-16: batch=1,head_num=3,seq_len=197,dim=192,block_num=12 ,result: (180M)180.23M
+    (vq)vit-s-16: batch=1,head_num=6,seq_len=197,dim=384,block_num=12  ,result: (360.005M)360.46M
+    (vq)vit-s-32: batch=1,head_num=6,seq_len=50,dim=384,block_num=12    ,result: (23.22M)23.11M
+    (vq)vit-b-16: batch=1,head_num=12,seq_len=197,dim=768,block_num=12  ,result: (0.72G)0.72G
     '''
     b=batch
     h = head_num

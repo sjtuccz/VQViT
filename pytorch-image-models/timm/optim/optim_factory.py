@@ -202,7 +202,7 @@ def param_group_fn_with_weight_decay(
         lr_decay: float = 0.01
 ):
     """
-    CCZ0219
+    0219
     合并学习率和权重衰减的设置。
     通过名称或指定层来设置不同的学习率和权重衰减。
     

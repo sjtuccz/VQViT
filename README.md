@@ -47,7 +47,7 @@ On ImageNet-1k:
 Please note that for large models such as vqvit_base or above, when training on ImageNet-1k, please enable Cutmix\Mixup and droppath.
 
 ```sh
-CUDA_VISIBLE_DEVICES=2 python trainvq.py -j 12 --vqtype tfsq --dict-dim 4 --fsq-level 3 3 3 3 --FLfn cos --Disfn DKD --klloss-weight 4.0 --featureloss-weight 0.0 --model vqvit_base_patch16_224 --teacher-model vit_base_patch16_224 --output /path/output/in1k --dataset imagenet1k --initial-checkpoint /path/output/in1k/vit_base_patch16_224-79.98/model_best.pth.tar --input-size 3 224 224  --sched cosine  --min-lr 1e-5 --warmup-lr 1e-4 --epochs 360 --warmup-epochs 5 --drop 0.0 --amp --cooldown-epochs 10 --featureloss-reduction sum --dictloss-weight 1.0 --clip-grad 600.0 --T 1.0 --scale 0.7 1.0  --mixup 1.0 --cutmix 1.0 --smoothing 0.0 --drop-path 0.1 -b 1024 --grad-accum-steps 4  --lr 4e-4 --opt adamw --weight-decay 0.01 --model-kwargs fsq_Tinit=-1
+CUDA_VISIBLE_DEVICES=2 python trainvq.py -j 12 --vqtype tfsq --dict-dim 4 --fsq-level 3 3 3 3 --FLfn cos --Disfn DKD --klloss-weight 4.0 --featureloss-weight 0.0 --model vqvit_small_patch16_224 --teacher-model vit_small_patch16_224 --output ./output/in1k --dataset imagenet1k --data-dir /path/imagenet1k --initial-checkpoint ./output/in1k/vit_small_patch16_224/model_best.pth.tar --input-size 3 224 224  --sched cosine  --min-lr 1e-5 --warmup-lr 1e-4 --epochs 360 --warmup-epochs 5 --drop 0.0 --amp --cooldown-epochs 10 --featureloss-reduction sum --dictloss-weight 1.0 --clip-grad 600.0 --T 1.0 --scale 0.7 1.0  --mixup 0.0 --cutmix 0.0 --smoothing 0.0 --drop-path 0.0 -b 1024 --grad-accum-steps 4  --lr 4e-4 --opt adamw --weight-decay 0.01 --model-kwargs fsq_Tinit=-1
 ```
 On CIFAR:
 ```sh
@@ -61,7 +61,7 @@ CUDA_VISIBLE_DEVICES=0 python trainvq.py -j 28 --vqtype tfsq --dict-dim 3 --fsq-
 
 On ImageNet-1k:
 ```sh
-CUDA_VISIBLE_DEVICES=3 python validate.py --model vqvit_small_patch16_224 --dataset imagenet1k --data-dir /path/imagenet1k --checkpoint /path/VQViT/output/cifar10/in1k_pre_c10-vqvit_small_patch32_224-97.96/model_best.pth.tar --model-kwargs vq_type='tfsq' dic_dim=4 fsq_level=[3,3,3,3] --reparam
+CUDA_VISIBLE_DEVICES=3 python validate.py --model vqvit_small_patch16_224 --dataset imagenet1k --data-dir /path/imagenet1k --checkpoint /path/VQViT/vqvit_small_patch32_224/model_best.pth.tar --model-kwargs vq_type='tfsq' dic_dim=4 fsq_level=[3,3,3,3] --reparam
 ```
 then, you will get:
 ```sh

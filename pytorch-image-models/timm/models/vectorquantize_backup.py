@@ -1167,7 +1167,7 @@ if __name__ == '__main__':
     plt.legend()
 
     # 保存图像（支持PNG/PDF/SVG等格式）
-    output_path = "/home/mulan/ccz/VQViT/FSQfig/quantization_error_heatmap.png"  # 修改为你的保存路径
+    output_path = "./VQViT/FSQfig/quantization_error_heatmap.png"  # 修改为你的保存路径
     plt.savefig(output_path, dpi=300, bbox_inches='tight')  # dpi控制分辨率
     print(f"图像已保存至: {output_path}")
     # from sklearn.decomposition import PCA
