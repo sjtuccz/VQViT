@@ -1218,13 +1218,19 @@ def train_one_epoch(
 
         # multiply by accum steps to get equivalent for full update
         data_time_m.update(accum_steps * (time.time() - data_start_time))
-
         def _forward():
             with amp_autocast():
                 if teacher_model:
                     with torch.no_grad():
-                        teacher_output, teacher_feat = teacher_model(input,is_feat=True)
-                output, dict_loss, feat = model(input,is_feat=True)
+                        teacher_output = teacher_model(input,is_feat=(args.featureloss_weight>0))
+                        if isinstance(teacher_output, tuple):
+                            teacher_feat = teacher_output[1]
+                            teacher_output = teacher_output[0]
+                output = model(input,is_feat=(args.featureloss_weight>0))
+                if isinstance(output, tuple):
+                    dict_loss = output[1]
+                    feat = output[2] if args.featureloss_weight>0 else None
+                    output = output[0]
                 loss = loss_fn(output, target) * args.celoss_weight
                 loss_dict = dict_loss * args.dictloss_weight
                 if not kl_criterion:

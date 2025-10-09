@@ -433,7 +433,6 @@ def main():
         in_chans = args.input_size[0]
 
     if 'cifar100' in args.dataset:
-        # args.data_dir = '/mnt/ccz/pytorch-cifar100-master/data/'
         args.data_dir = '../../pytorch-cifar100-master/data/'
         args.mean = CIFAR100_TRAIN_MEAN
         args.std = CIFAR100_TRAIN_STD

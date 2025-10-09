@@ -70,6 +70,8 @@ from .vision_transformer_vq import *
 from .vision_transformer_hybrid import *
 from .vision_transformer_relpos import *
 from .vision_transformer_sam import *
+from .poolformer import *
+from .poolformer_vq import *
 from .volo import *
 from .vovnet import *
 from .xception import *

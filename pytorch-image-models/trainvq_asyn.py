@@ -1,23 +1,45 @@
 #!/usr/bin/env python3
-""" ImageNet Training Script
+""" VQ-ViT Training Script
+Rewritten from the train.py script of the timm library
 
-This is intended to be a lean and easily modifiable ImageNet training script that reproduces ImageNet
-training results with some of the latest networks and training techniques. It favours canonical PyTorch
-and standard Python style over trying to be able to 'do it all.' That said, it offers quite a few speed
-and training result improvements over the usual PyTorch example scripts. Repurpose as you see fit.
-
-This script was started from an early version of the PyTorch ImageNet example
-(https://github.com/pytorch/examples/tree/master/imagenet)
-
-NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
-(https://github.com/NVIDIA/apex/tree/master/examples/imagenet)
-
-Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
+for example:
+CUDA_VISIBLE_DEVICES=1 python trainvq.py -j 16 
+--vqtype tfsq 
+--dict-dim 4
+--fsq-level 3 3 3 3
+--FLfn cos 
+--Disfn DKD 
+--klloss-weight 4.0 
+--featureloss-weight 0.0 
+--model vqvit_tiny_patch16_224 
+--teacher-model vit_tiny_patch16_224 
+--output  
+--dataset imagenet1k 
+--data-dir 
+--initial-checkpoint  
+--input-size 3 224 224  
+--sched cosine  
+--min-lr 1e-5 
+--warmup-lr 1e-5 
+--epochs 400 
+--warmup-epochs 5 
+--drop 0.0 
+--amp 
+--cooldown-epochs 10 
+--featureloss-reduction sum 
+--dictloss-weight 1.0 
+--clip-grad 600.0 
+--T 1.0 
+--scale 0.5 1.0  
+--mixup 0.0 --cutmix 0.0 --smoothing 0.0 --drop-path 0.0 
+-b 1024 --grad-accum-steps 4  
+--lr 4e-4 --opt adamw --weight-decay 0.1 
+--model-kwargs fsq_Tinit=-1
 """
 import argparse
 import logging
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com" # for downloading dataset or weight huggingface hub
 
 import time
 from collections import OrderedDict
@@ -35,15 +57,15 @@ from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
 from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy
-from timm.models import create_model,safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
+from timm.models import create_model, create_teacher_model,safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
 from timm.optim import create_optimizer_v2, optimizer_kwargs, param_group_fn_with_weight_decay, param_group_fn_with_weight_decay_vq
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
 from timm.data.constants import CIFAR10_MEAN, CIFAR10_STD, CIFAR100_TRAIN_MEAN, CIFAR100_TRAIN_STD, TINY_IMAGENET_MEAN, TINY_IMAGENET_STD,IMAGENET_DEFAULT_MEAN,IMAGENET_DEFAULT_STD
-# CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
-# CIFAR10_STD = (0.2471, 0.2435, 0.2616)
-# CIFAR100_TRAIN_MEAN = [0.5071, 0.4867, 0.4408]#(0.5070751592371323, 0.48654887331495095, 0.4409178433670343)
-# CIFAR100_TRAIN_STD =  [0.2675, 0.2565, 0.2761]#(0.2673342858792401, 0.2564384629170883, 0.27615047132568404)
+
+from distill import *
+from sklearn.decomposition import PCA
+from einops import rearrange, repeat, reduce, pack, unpack
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -105,20 +127,36 @@ group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
 
 # Model parameters
 group = parser.add_argument_group('Model parameters')
-group.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
+group.add_argument('--model', default='vit_small_patch32_224', type=str, metavar='MODEL',
                    help='Name of model to train (default: "resnet50")')
+
+group.add_argument('--vqtype', default='tfsq', type=str, metavar='VQ',
+                   help='vqtype: vq or fsq')
+group.add_argument('--fsq-level', type=int, nargs='+', default=[3,3,3,3], metavar='FSQLEVEL',
+                   help='fsq level')
+
+group.add_argument('--kmeans-init-code', action='store_true', default=False,
+                   help='vit feature kmeans init codebook. (default: False)')
+group.add_argument('--init-fsqt', action='store_true', default=False,
+                   help='vit feature init T of fsq if using fsq. (default: False)')
+group.add_argument('--freeze-wo-vq', action='store_true', default=False,
+                   help=' freeze all except vq block. (default: False)')
+group.add_argument('--shared-codebook', action='store_true', default=False,
+                   help=' share the codebook across all VQBlock. (default: False)')
 parser.add_argument('--dict-num', default=256, type=int, metavar='vqvit_dict',
                     help='vqvit dict size')
 parser.add_argument('--dict-dim', default=2, type=int, metavar='vqvit_dict_dim',
                     help='vqvit dict dim')
-
+parser.add_argument('--teacher-model', default=None, type=str, metavar='TEACHER-MODEL',
+                    help='Name of model to train (default: "countception"')
 group.add_argument('--pretrained', action='store_true', default=False,
                    help='Start with pretrained version of specified network (if avail)')
 group.add_argument('--pretrained-finetune', action='store_true', default=False,
                    help='use different lr for pretrained layers and head (default: False)')
 group.add_argument('--initial-checkpoint', default=None, type=str, metavar='PATH',
                    help='Initialize model from this checkpoint (default: none)')
-
+parser.add_argument('--teacher-checkpoint', default=None, type=str, metavar='PATH',
+                    help='Initialize model from this checkpoint (default: none)')
 
 group.add_argument('--resume', default='', type=str, metavar='PATH',
                    help='Resume full model and optimizer state from checkpoint (default: none)')
@@ -143,7 +181,7 @@ group.add_argument('--std', type=float, nargs='+', default=None, metavar='STD',
                    help='Override std deviation of dataset')
 group.add_argument('--interpolation', default='', type=str, metavar='NAME',
                    help='Image resize interpolation type (overrides model)')
-group.add_argument('-b', '--batch-size', type=int, default=128, metavar='N',
+group.add_argument('-b', '--batch-size', type=int, default=1024, metavar='N',
                    help='Input batch size for training (default: 128)')
 group.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                    help='Validation batch size override (default: None)')
@@ -192,11 +230,15 @@ group.add_argument('--opt-kwargs', nargs='*', default={}, action=utils.ParseKwar
 # loss
 parser.add_argument('--T', type=float, default=1.0,
                     help='knowledge distillation loss temperature')
+parser.add_argument('--top-k', type=int, default=None,
+                    help='top k for distillation cos sim loss')
 parser.add_argument('--dictloss-weight', type=float, default=1.0, help='dic loss weight')
-parser.add_argument('--loss-weight', type=float, default=1.0, help='loss weight')
-parser.add_argument('--klloss-weight', type=float, default=1.0, help='kl loss weight')
-parser.add_argument('--FLfn', default='L2', type=str, metavar='FLossFunc',
+parser.add_argument('--celoss-weight', type=float, default=1.0, help='loss weight')
+parser.add_argument('--klloss-weight', type=float, default=4.0, help='kl loss weight')
+parser.add_argument('--FLfn', default='cos', type=str, metavar='FLossFunc',
                     help='type of feature loss func (default: L2) One of ("L2", "KL", "")')
+parser.add_argument('--Disfn', default='DKD', type=str, metavar='DIStillLossFunc',
+                    help='type of distillation loss func (default: KlDiv) One of ("CE", "KL", "")')
 parser.add_argument('--featureloss-weight', type=float, default=2.0, help='feature loss weight')
 parser.add_argument('--featureloss-reduction', default='mean', type=str, metavar='POOL',
                     help='sum or mean reduction for feature loss (default: sum)')
@@ -233,9 +275,9 @@ group.add_argument('--lr-k-decay', type=float, default=1.0,
                    help='learning rate k-decay for cosine/poly (default: 1.0)')
 group.add_argument('--warmup-lr', type=float, default=1e-5, metavar='LR',
                    help='warmup learning rate (default: 1e-5)')
-group.add_argument('--min-lr', type=float, default=1e-7, metavar='LR',
+group.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
                    help='lower lr bound for cyclic schedulers that hit 0 (default: 0)')
-group.add_argument('--epochs', type=int, default=500, metavar='N',
+group.add_argument('--epochs', type=int, default=360, metavar='N',
                    help='number of epochs to train (default: 300)')
 group.add_argument('--epoch-repeats', type=float, default=0., metavar='N',
                    help='epoch repeat multiplier (number of times to repeat dataset epoch per train epoch).')
@@ -314,6 +356,11 @@ group.add_argument('--drop-connect', type=float, default=None, metavar='PCT',
                    help='Drop connect rate, DEPRECATED, use drop-path (default: None)')
 group.add_argument('--drop-path', type=float, default=0.0, metavar='PCT',
                    help='Drop path rate (default: None)')
+group.add_argument('--attn-drop-rate', type=float, default=0.0, metavar='PCT',
+                   help='Attention Drop path rate (default: None)')
+# proj_drop_rate
+group.add_argument('--proj-drop-rate', type=float, default=0.0, metavar='PCT',
+                   help='Attention projection layer Drop path rate (default: None)')
 group.add_argument('--drop-block', type=float, default=None, metavar='PCT',
                    help='Drop block rate (default: None)')
 
@@ -402,23 +449,98 @@ def _parse_args():
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
 
+from kmeans_init_codebook import kmeans_pca_fit_dim
+def init_codebook(model, feat_list):
+    '''使用kmeans聚类token进行codebook的初始化，如果token和codebook的维度不同，则使用PCA降维'''
+    print('===============================================================init codebook using kmeans vit features')
+    if isinstance(feat_list[0], (list,tuple)):
+        for block, feat in zip(model.blocks, feat_list):
+            # for vq qkv , vq proj
+            device = block.vq.embedding.weight.device
+            qkv_feat = feat[0]
+            proj_feat = feat[1]
+            qkv_centroids, counts = kmeans_pca_fit_dim(qkv_feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            block.vq.embedding.weight.data = qkv_centroids.to(device)
+
+            # proj_centroids, counts = kmeans_pca_fit_dim(proj_feat, block.attn.vq.embedding.weight.data.shape[0], block.attn.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            # block.attn.vq.embedding.weight.data = proj_centroids.to(device)
+
+            # # for vq qkv , vq ffn
+            # device = block.vq.embedding.weight.device
+            # attn_feat = feat[0]
+            # ffn_feat = feat[1]
+            # ffn_centroids, counts = kmeans_pca_fit_dim(ffn_feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            # block.vq.embedding.weight.data = ffn_centroids.to(device)
+
+            # attn_centroids, counts = kmeans_pca_fit_dim(attn_feat, block.attnvq.embedding.weight.data.shape[0], block.attnvq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            # block.attnvq.embedding.weight.data = attn_centroids.to(device)
+    else:
+        for block, feat in zip(model.blocks, feat_list):
+            
+            # device = block.vq.embedding.weight.device
+            # centroids, counts = kmeans_pca_fit_dim(feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            # block.vq.embedding.weight.data = centroids.to(device)
+
+            device = block.attn.vq.embedding.weight.device
+            attn_centroids, counts = kmeans_pca_fit_dim(feat, block.attn.vq.embedding.weight.data.shape[0], block.attn.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
+            block.attn.vq.embedding.weight.data = attn_centroids.to(device)
+
+def init_fsqt(model, feat_list):
+    
+    print('===============================================================init T of fsq using vit features')
+    step = 0.1
+    t_range = (torch.arange(1, 101) * step).round(decimals=1).to(feat_list[0].device)  # 1→0.1, 2→0.2,..., 50→5.0
+    for block, feat in zip(model.blocks, feat_list):
+        fsq = block.vq
+        codebook_dim = block.vq.codebook_dim
+        # max_value = feat.max()
+        # min_value = feat.min()
+        # mean = feat.mean()
+        # std = feat.std()
+        # input = mean + std * torch.randn(1, 100000, codebook_dim, device=feat.device)
+        # input = torch.clamp(input, min=-min_value, max=max_value)
+        # print(f'mean: {mean}, std: {std}, max_value: {max_value}, min_value: {min_value}')
+
+        samples = rearrange(feat, 'b h d ->(b h) d') 
+        x_np = samples.cpu().numpy()
+        pca = PCA(n_components=codebook_dim)
+        x_reduced = pca.fit_transform(x_np)
+        input = torch.from_numpy(x_reduced)
+        input = rearrange(input, '(b h) d -> b h d', b=feat.shape[0], h=feat.shape[1]).to(feat.device)
+
+        error_recoed = []
+        for i, t in enumerate(t_range):
+            fsq.T = t
+            output1 = fsq.quantize(input)
+            error = torch.abs(output1 - input).sum()
+            error_recoed.append(error)
+            # print(f'i: {i}, error: {error}, t: {t}')
+        t_optimal = t_range[error_recoed.index(min(error_recoed))]
+        fsq.T = t_optimal
+        print(f't_optimal: {t_optimal}')
+
+        
+
 def main():
     utils.setup_default_logging()
     args, args_text = _parse_args()
-
+    print('args.batch_size:  ',args.batch_size)
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
     args.prefetcher = not args.no_prefetcher
     args.grad_accum_steps = max(1, args.grad_accum_steps)
-    device = utils.init_distributed_device(args)
+    device0 = utils.init_distributed_device(args)
+    teacher_device = torch.device('cuda:1')
+    student_device = torch.device('cuda:0')
+
     if args.distributed:
         _logger.info(
             'Training in distributed mode with multiple processes, 1 device per process.'
             f'Process {args.rank}, total {args.world_size}, device {args.device}.')
     else:
-        _logger.info(f'Training with a single process on 1 device ({args.device}).')
+        _logger.info(f'Training with a single process on 2 device for distillation ({student_device} and {teacher_device}).')
     assert args.rank >= 0
 
     # resolve AMP arguments based on PyTorch / Apex availability
@@ -485,6 +607,8 @@ def main():
         num_classes=args.num_classes,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
+        attn_drop_rate=args.attn_drop_rate,
+        proj_drop_rate=args.proj_drop_rate,
         drop_block_rate=args.drop_block,
         global_pool=args.gp,
         bn_momentum=args.bn_momentum,
@@ -494,18 +618,35 @@ def main():
         # strict=True,
         strict=False,
         dic_n=args.dict_num, dic_dim=args.dict_dim,
+        vq_type=args.vqtype,
+        fsq_level=args.fsq_level,
         **args.model_kwargs,
     )
-    def freeze_attn_layers_but_keep_grad(model):
-        print("freeze MHA")
+    if args.shared_codebook:
+        model.use_shared_codebook()
+
+    def freeze_but_keep_VQ_grad(model):
+        print("freeze VQ Block")
         for name, param in model.named_parameters():
-            if 'attn' in name:
+            if 'vq' in name or 'head' in name:
+                param.requires_grad = True
+            else:
                 param.requires_grad = False 
+    if args.freeze_wo_vq:
+        print('freezing all except vq')
+        freeze_but_keep_VQ_grad(model)
 
-    freeze_attn_layers_but_keep_grad(model)
-
-
-
+    init_teacher_checkpoint = args.teacher_checkpoint or args.initial_checkpoint
+    teacher_model = None
+    if (args.klloss_weight or args.featureloss_weight) and args.teacher_model:
+        teacher_model = create_teacher_model(
+            model_name = args.teacher_model,
+            num_classes=args.num_classes,
+            checkpoint_path=init_teacher_checkpoint,
+            global_pool=args.gp,
+            img_size=args.img_size,
+        )
+    
     if args.head_init_scale is not None:
         with torch.no_grad():
             model.get_classifier().weight.mul_(args.head_init_scale)
@@ -524,7 +665,10 @@ def main():
     if utils.is_primary(args):
         _logger.info(
             f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
-        
+        _logger.info(
+            f'Teacher Model {safe_model_name(args.teacher_model)} created, param count: {sum([m.numel() for m in teacher_model.parameters()]) if teacher_model is not None else 0}' )
+         
+
     data_config = resolve_data_config(vars(args), model=model, verbose=utils.is_primary(args))
 
     # setup augmentation batch splits for contrastive loss or split bn
@@ -539,9 +683,13 @@ def main():
         model = convert_splitbn_model(model, max(num_aug_splits, 2))
 
     # move model to GPU, enable channels last layout if set
-    model.to(device=device)
+    model.to(device=student_device, non_blocking=True)
+    if teacher_model:
+        teacher_model.to(device=teacher_device, non_blocking=True).eval()
     if args.channels_last:
         model.to(memory_format=torch.channels_last)
+        if teacher_model:
+            teacher_model.to(memory_format=torch.channels_last)
 
     # setup synchronized BatchNorm for distributed training
     if args.distributed and args.sync_bn:
@@ -595,6 +743,7 @@ def main():
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
     loss_scaler = None
+    device = student_device
     if use_amp == 'apex':
         assert device.type == 'cuda'
         model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
@@ -637,18 +786,7 @@ def main():
         if args.resume:
             load_checkpoint(model_ema.module, args.resume, use_ema=True)
 
-    # setup distributed training
-    if args.distributed:
-        if has_apex and use_amp == 'apex':
-            # Apex DDP preferred unless native amp is activated
-            if utils.is_primary(args):
-                _logger.info("Using NVIDIA APEX DistributedDataParallel.")
-            model = ApexDDP(model, delay_allreduce=True)
-        else:
-            if utils.is_primary(args):
-                _logger.info("Using native Torch DistributedDataParallel.")
-            model = NativeDDP(model, device_ids=[device], broadcast_buffers=not args.no_ddp_bb) #, find_unused_parameters=True
-        # NOTE: EMA model does not need to be wrapped by DDP
+    # setup distributed trainin
 
     if args.torchcompile:
         # torch compile should be done after DDP
@@ -735,10 +873,42 @@ def main():
         distributed=args.distributed,
         collate_fn=collate_fn,
         pin_memory=args.pin_mem,
-        device=device,
+        device=student_device,
         use_multi_epochs_loader=args.use_multi_epochs_loader,
         worker_seeding=args.worker_seeding,
     )
+    loader_init = None
+    if args.kmeans_init_code or args.init_fsqt:
+        loader_init = create_loader(
+            dataset_train,
+            input_size=data_config['input_size'],
+            batch_size=6000,
+            is_training=True,
+            use_prefetcher=args.prefetcher,
+            no_aug=args.no_aug,
+            re_prob=args.reprob,
+            re_mode=args.remode,
+            re_count=args.recount,
+            re_split=args.resplit,
+            scale=args.scale,
+            ratio=args.ratio,
+            hflip=args.hflip,
+            vflip=args.vflip,
+            color_jitter=args.color_jitter,
+            auto_augment=args.aa,
+            num_aug_repeats=args.aug_repeats,
+            num_aug_splits=num_aug_splits,
+            interpolation=train_interpolation,
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=1,
+            distributed=args.distributed,
+            collate_fn=collate_fn,
+            pin_memory=False,
+            device=device,
+            use_multi_epochs_loader=False,
+            worker_seeding=args.worker_seeding,
+        )
 
     eval_workers = args.workers
     if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
@@ -757,7 +927,7 @@ def main():
         distributed=args.distributed,
         crop_pct=data_config['crop_pct'],
         pin_memory=args.pin_mem,
-        device=device,
+        device=student_device,
     )
 
     # setup loss function
@@ -777,8 +947,33 @@ def main():
             train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
         train_loss_fn = nn.CrossEntropyLoss()
-    train_loss_fn = train_loss_fn.to(device=device)
-    validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
+    train_loss_fn = train_loss_fn.to(device=student_device)
+    validate_loss_fn = nn.CrossEntropyLoss().to(device=student_device)
+    if args.klloss_weight==0.0:
+        kl_criterion =  None
+    elif args.Disfn=='CE':
+        kl_criterion =  DistillCE().to(device=student_device)
+    elif args.Disfn=='cos':
+        kl_criterion =  DistillCosSim(args.top_k).to(device=student_device)
+    elif args.Disfn=='klandcos':
+        kl_criterion =  DistillKLandCosSim(args.T).to(device=student_device)
+    elif args.Disfn=='DKD':
+        # kl_criterion = DKD(args.T, alpha=0.2, beta=1.8).to(device=device)
+        kl_criterion = DKD(args.T, alpha=0.5, beta=1.5).to(device=student_device)
+    else:   
+        kl_criterion =  DistillKL(args.T).to(device=student_device)
+
+    if args.featureloss_weight ==0:
+        feature_criterion =  None
+    elif args.FLfn=='KL':
+        feature_criterion =  FeatureLossKL(reduction=args.featureloss_reduction).to(device=student_device)
+    elif args.FLfn=='cos':
+        feature_criterion =  FeatureLossCosine(reduction=args.featureloss_reduction).to(device=student_device)
+    elif args.FLfn=='klcos':
+        feature_criterion =  FeatureLossCosineKL(reduction=args.featureloss_reduction).to(device=student_device)
+    else:
+        feature_criterion =  FeatureLossL2(reduction=args.featureloss_reduction).to(device=student_device)
+        
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
@@ -862,10 +1057,14 @@ def main():
             train_metrics = train_one_epoch(
                 epoch,
                 model,
+                teacher_model,
                 loader_train,
                 optimizer,
                 train_loss_fn,
+                kl_criterion, feature_criterion,
                 args,
+                teacher_device=teacher_device,
+                student_device=student_device,
                 lr_scheduler=lr_scheduler,
                 saver=saver,
                 output_dir=output_dir,
@@ -873,7 +1072,14 @@ def main():
                 loss_scaler=loss_scaler,
                 model_ema=model_ema,
                 mixup_fn=mixup_fn,
+                loader_init=loader_init if loader_init else None
             )
+            if loader_init:
+                # onlu use once
+                if hasattr(loader_init, '_workers'):
+                    loader_init._shutdown_workers() 
+                del loader_init
+            loader_init=None
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if utils.is_primary(args):
@@ -934,11 +1140,14 @@ def main():
 def train_one_epoch(
         epoch,
         model,
+        teacher_model,
         loader,
         optimizer,
         loss_fn,
+        kl_criterion, feature_criterion,
         args,
-        device=torch.device('cuda'),
+        teacher_device=torch.device('cuda:0'),
+        student_device=torch.device('cuda:1'),
         lr_scheduler=None,
         saver=None,
         output_dir=None,
@@ -946,6 +1155,7 @@ def train_one_epoch(
         loss_scaler=None,
         model_ema=None,
         mixup_fn=None,
+        loader_init=None
 ):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
@@ -959,8 +1169,12 @@ def train_one_epoch(
     data_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
     losses_dict_m= utils.AverageMeter()
+    losses_kl_m = utils.AverageMeter()
+    losses_feature_m = utils.AverageMeter()
 
     model.train()
+    if teacher_model:
+        teacher_model.eval()
 
     accum_steps = args.grad_accum_steps
     last_accum_steps = len(loader) % accum_steps
@@ -972,15 +1186,27 @@ def train_one_epoch(
     data_start_time = update_start_time = time.time()
     optimizer.zero_grad()
     update_sample_count = 0
+
+    if loader_init and not args.resume:
+        for batch_idx, (input, target) in enumerate(loader_init):
+            if teacher_model:
+                with torch.no_grad():
+                    teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
+            if args.vqtype == 'vq' and args.kmeans_init_code:
+                init_codebook(model,init_feat_list)
+            elif args.vqtype == 'fsq' and args.init_fsqt:
+                init_fsqt(model,init_feat_list)
+            break
+
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_batch_idx
         need_update = last_batch or (batch_idx + 1) % accum_steps == 0
         update_idx = batch_idx // accum_steps
         if batch_idx >= last_batch_idx_to_accum:
             accum_steps = last_accum_steps
-
+        teacher_input = input.to(teacher_device, non_blocking=True) if teacher_model else None
         if not args.prefetcher:
-            input, target = input.to(device), target.to(device)
+            input, target = input.to(student_device), target.to(student_device)
             if mixup_fn is not None:
                 input, target = mixup_fn(input, target)
         if args.channels_last:
@@ -988,18 +1214,41 @@ def train_one_epoch(
 
         # multiply by accum steps to get equivalent for full update
         data_time_m.update(accum_steps * (time.time() - data_start_time))
-
         def _forward():
             with amp_autocast():
-                output, dict_loss = model(input,is_feat=False)
-                loss = loss_fn(output, target)
+                output = model(input,is_feat=(args.featureloss_weight>0))
+                # print(f'output device: {output[0].device} {output[1].device} ' if isinstance(output, tuple) else f'output device: {output.device}')
+                if teacher_model:
+                    with torch.no_grad():
+                        teacher_output = teacher_model(teacher_input, is_feat=(args.featureloss_weight>0)).to(student_device, non_blocking=True)
+                        torch.cuda.synchronize(student_device)
+                        if isinstance(teacher_output, tuple):
+                            teacher_feat = teacher_output[1]
+                            teacher_output = teacher_output[0]
+                
+                if isinstance(output, tuple):
+                    dict_loss = output[1]
+                    feat = output[2] if args.featureloss_weight>0 else None
+                    output = output[0]
+                loss = loss_fn(output, target) * args.celoss_weight
                 loss_dict = dict_loss * args.dictloss_weight
-                sum_loss = [loss , loss_dict]
-            
+                if not kl_criterion:
+                    loss_kl = torch.tensor(0.0).to(student_device)
+                elif isinstance(kl_criterion, DKD):
+                    loss_kl =  kl_criterion(output, teacher_output.detach(), target) * args.klloss_weight
+                else:
+                    loss_kl =  kl_criterion(output, teacher_output.detach()) * args.klloss_weight
+                if not feature_criterion:
+                    loss_feature = torch.tensor(0.0).to(student_device)
+                else:
+                    loss_feature = feature_criterion(feat,teacher_feat) *args.featureloss_weight
+                sum_loss = [loss , loss_dict ,loss_kl, loss_feature]
             return sum_loss
 
         def _backward(_loss):
             if isinstance(_loss, list):
+                # for _l in _loss:
+                #     print(_l.device)
                 _loss = torch.sum(torch.stack(_loss))
             if accum_steps > 1:
                 _loss /= accum_steps
@@ -1036,8 +1285,11 @@ def train_one_epoch(
             _backward(loss)
 
         if not args.distributed:
-            losses_m.update(loss[0].item() * accum_steps, input.size(0))
+            losses_m.update(loss[0].item(), input.size(0))
+            # losses_m.update(loss[0].item() * accum_steps, input.size(0))
             losses_dict_m.update(loss[1].item(), input.size(0))
+            losses_kl_m.update(loss[2].item(), input.size(0))
+            losses_feature_m.update(loss[3].item(), input.size(0))
 
         update_sample_count += input.size(0)
 
@@ -1067,6 +1319,12 @@ def train_one_epoch(
                 reduced_loss = utils.reduce_tensor(loss[1].data, args.world_size)
                 losses_dict_m.update(reduced_loss.item()* accum_steps, input.size(0))
 
+                reduced_loss = utils.reduce_tensor(loss[2].data, args.world_size)
+                losses_kl_m.update(reduced_loss.item()* accum_steps, input.size(0))
+
+                reduced_loss = utils.reduce_tensor(loss[3].data, args.world_size)
+                losses_feature_m.update(reduced_loss.item()* accum_steps, input.size(0))
+
                 update_sample_count *= args.world_size
 
             if utils.is_primary(args):
@@ -1076,6 +1334,8 @@ def train_one_epoch(
                     f'({100. * update_idx / (updates_per_epoch - 1):>3.0f}%)] '
                     f'Ls: {losses_m.val:#.3g} ({losses_m.avg:#.3g}) '
                     f'Ld: {losses_dict_m.val:#.3g} ({losses_dict_m.avg:#.3g}) '
+                    f'Lk: {losses_kl_m.val:#.3g} ({losses_kl_m.avg:#.3g}) '
+                    f'Lf: {losses_feature_m.val:#.3g} ({losses_feature_m.avg:#.3g}) '
                     f'Tm: {update_time_m.val:.3f}s, {update_sample_count / update_time_m.val:>7.2f}/s '
                     f'({update_time_m.avg:.3f}s, {update_sample_count / update_time_m.avg:>7.2f}/s) '
                     f'LR: {lr:.3e} '

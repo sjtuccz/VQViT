@@ -83,7 +83,7 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         # print(q.shape, k.shape, v.shape)
         q, k = self.q_norm(q), self.k_norm(k)
-
+        # print(f'Attention q mean:{q.mean().item()}, std: {q.std().item()}, k mean:{k.mean().item()} , std: {k.std().item()}, qk std:{(q @ k.transpose(-2, -1)).std().item()}, scale:{self.scale}   ')
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q, k, v,

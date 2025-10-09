@@ -204,7 +204,7 @@ def cal_qkvMatDot_FLOPs(batch=1,head_num=6,seq_len=197,dim=384,block_num=12):
     
     (vq)vit-t-16: batch=1,head_num=3,seq_len=197,dim=192,block_num=12 ,result: (180M)180.23M
     (vq)vit-s-16: batch=1,head_num=6,seq_len=197,dim=384,block_num=12  ,result: (360.005M)360.46M
-    (vq)vit-s-32: batch=1,head_num=6,seq_len=50,dim=384,block_num=12    ,result: (23.22M)23.11M
+    (vq)vit-s-32: batch=1,head_num=6,seq_len=50,dim=384,block_num=12    ,result: (23.11M)23.22M
     (vq)vit-b-16: batch=1,head_num=12,seq_len=197,dim=768,block_num=12  ,result: (0.72G)0.72G
     '''
     b=batch
@@ -223,7 +223,7 @@ def format_param_count(param_count, decimal_places=2):
         return f"{round(param_count / 1e3, decimal_places)}K" 
 def validate(args):
     # might as well try to validate something
-    args.pretrained = args.pretrained or not args.checkpoint
+    # args.pretrained = args.pretrained or not args.checkpoint
     args.prefetcher = not args.no_prefetcher
 
     if torch.cuda.is_available():
