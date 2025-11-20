@@ -101,10 +101,6 @@ parser.add_argument('--checkpoint', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
-parser.add_argument('--save-pretrained', action='store_true',default=False,
-                    help='save pre-trained model weight')
-parser.add_argument('--pretrained-save-path', default='./pretrained_weights/', type=str, metavar='PATH',
-                    help='path to latest checkpoint (default: none)')
 parser.add_argument('--num-gpu', type=int, default=1,
                     help='Number of GPUS to use')
 parser.add_argument('--test-pool', dest='test_pool', action='store_true',
@@ -218,8 +214,6 @@ def format_param_count(param_count, decimal_places=2):
 def validate(args):
     # might as well try to validate something
     # args.pretrained = args.pretrained or not args.checkpoint
-    args.prefetcher = not args.no_prefetcher
-
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
@@ -271,23 +265,6 @@ def validate(args):
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes
 
-    if args.checkpoint:
-        load_checkpoint(model, args.checkpoint, args.use_ema, strict=False)
-
-    # if args.pre_calculate:
-        # model.pre_calculate()
-
-    if args.reparam:
-        # model = reparameterize_model(model)
-        model.reparameterize()
-        for name, param in model.named_parameters():
-            num_params = param.numel()
-            print(f"{name:35} | Shape: {str(list(param.shape)):20} | Params: {num_params:10,}")
-
-
-    param_count = sum([m.numel() for m in model.parameters()])
-    # _logger.info('Model %s created, param count: %d' % (args.model, param_count))
-    
     data_config = resolve_data_config(
         vars(args),
         model=model,
@@ -295,178 +272,66 @@ def validate(args):
         verbose=True,
     )
     
-    test_time_pool = False
-    if args.test_pool:
-        model, test_time_pool = apply_test_time_pool(model, data_config)
-
-    model = model.to(device)
-    if args.channels_last:
-        model = model.to(memory_format=torch.channels_last)
-
-    if args.torchscript:
-        assert not use_amp == 'apex', 'Cannot use APEX AMP with torchscripted model'
-        model = torch.jit.script(model)
-    elif args.torchcompile:
-        assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
-        torch._dynamo.reset()
-        model = torch.compile(model, backend=args.torchcompile)
-    elif args.aot_autograd:
-        assert has_functorch, "functorch is needed for --aot-autograd"
-        model = memory_efficient_fusion(model)
-
+    # if args.pre_calculate:
+        # model.pre_calculate()
+    
+    
+    # _logger.info('Model %s created, param count: %d' % (args.model, param_count))
+    
     if use_amp == 'apex':
         model = amp.initialize(model, opt_level='O1')
 
     if args.num_gpu > 1:
         model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu)))
 
-    criterion = nn.CrossEntropyLoss().to(device)
-
-    root_dir = args.data or args.data_dir
-    dataset = create_dataset(
-        root=root_dir,
-        name=args.dataset,
-        split=args.split,
-        download=args.dataset_download,
-        load_bytes=args.tf_preprocessing,
-        class_map=args.class_map,
-    )
-
-    if args.valid_labels:
-        with open(args.valid_labels, 'r') as f:
-            valid_labels = [int(line.rstrip()) for line in f]
-    else:
-        valid_labels = None
-
-    if args.real_labels:
-        real_labels = RealLabelsImagenet(dataset.filenames(basename=True), real_json=args.real_labels)
-    else:
-        real_labels = None
-
-    crop_pct = 1.0 if test_time_pool else data_config['crop_pct']
-    loader = create_loader(
-        dataset,
-        input_size=data_config['input_size'],
-        batch_size=args.batch_size,
-        use_prefetcher=args.prefetcher,
-        interpolation=data_config['interpolation'],
-        mean=data_config['mean'],
-        std=data_config['std'],
-        num_workers=args.workers,
-        crop_pct=crop_pct,
-        crop_mode=data_config['crop_mode'],
-        pin_memory=args.pin_mem,
-        device=device,
-        tf_preprocessing=args.tf_preprocessing,
-    )
-
-    batch_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
-
-    model.eval()
-    with torch.no_grad():
-        # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
-        input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).to(device)
-        if args.channels_last:
-            input = input.contiguous(memory_format=torch.channels_last)
-        with amp_autocast():
-            model(input)
-        end = time.time()
-        for batch_idx, (input, target) in enumerate(loader):
-            if args.no_prefetcher:
-                target = target.to(device)
-                input = input.to(device)
-            if args.channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
-
-            # compute output
-            with amp_autocast():
-                output = model(input)
-                if isinstance(output, (tuple,list)):
-                    output = output[0]
-                if valid_labels is not None:
-                    output = output[:, valid_labels]
-                loss = criterion(output, target)
-
-            if real_labels is not None:
-                real_labels.add_result(output)
-
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output.detach(), target, topk=(1, 5))
-            losses.update(loss.item(), input.size(0))
-            top1.update(acc1.item(), input.size(0))
-            top5.update(acc5.item(), input.size(0))
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if batch_idx % args.log_freq == 0:
-                _logger.info(
-                    'Test: [{0:>4d}/{1}]  '
-                    'Time: {batch_time.val:.3f}s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
-                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.3f} ({top1.avg:>7.3f})  '
-                    'Acc@5: {top5.val:>7.3f} ({top5.avg:>7.3f})'.format(
-                        batch_idx,
-                        len(loader),
-                        batch_time=batch_time,
-                        rate_avg=input.size(0) / batch_time.avg,
-                        loss=losses,
-                        top1=top1,
-                        top5=top5
-                    )
-                )
-    if args.save_pretrained and args.pretrained:
-        torch.save(model.state_dict(), args.pretrained_save_path+args.model+'.pth')
-    if real_labels is not None:
-        # real labels mode replaces topk values at the end
-        top1a, top5a = real_labels.get_accuracy(k=1), real_labels.get_accuracy(k=5)
-    else:
-        top1a, top5a = top1.avg, top5.avg
-    if 'vq' in args.model:
-        average_util = model.print_codebook_utilization()
-    from thop import profile, clever_format
+    crop_pct = data_config['crop_pct']
     
+    input=torch.randn(1,data_config['input_size'][0],data_config['input_size'][1],data_config['input_size'][2]).to(device)
+    if args.reparam:
+        model.eval()
+        model = model.to(device)
+        output_before_reparam=model(input)
+        if isinstance(output_before_reparam, tuple):
+            output_before_reparam = output_before_reparam[0]
+        model = model.to('cpu')
+        model.reparameterize()
+    for name, param in model.named_parameters():
+        num_params = param.numel()
+        print(f"{name:35} | Shape: {str(list(param.shape)):20} | Params: {num_params:10,}")
+
+
+    from thop import profile, clever_format
     model.eval()
-    input=torch.randn(1,data_config['input_size'][0],data_config['input_size'][1],data_config['input_size'][2]).cuda()
+    model = model.to(device)
     output=model(input)
     if isinstance(output, tuple):
         output = output[0]
+    if args.reparam:
+        is_same = torch.allclose(output_before_reparam, output, atol=1e-3)
+        print("output is consistent Before and after token wise reparameterization:" ,is_same)
+    param_count = sum([m.numel() for m in model.parameters()])
     flops, params = profile(model, inputs=(input,))
-    print(params)
     if 'vit' in args.model:
         flops = add_attention_qkvMatDot_FLOPs(flops, args.model)
-    print(flops)
     if 'swin' in args.model:
         if hasattr(model, 'flops'):
             flops = model.flops()
         else:
             raise NotImplementedError("Please implement flops calculation function for swin model")
     flops, params = clever_format([flops, params], "%.3f")
+
+    if 'vq' in args.model:
+        average_util = model.print_codebook_utilization()
     results = OrderedDict(
-        dataset = args.dataset,
-        checkpoint = args.checkpoint,
         model=args.model,
-        top1=round(top1a, 4), # top1_err=round(100 - top1a, 4),
-        # top5=round(top5a, 4), #top5_err=round(100 - top5a, 4),
-        # param_count=round(param_count, 2),
         param_count=format_param_count(param_count),
         FLOPs=flops,
         img_size=data_config['input_size'],
         crop_pct=crop_pct,
         interpolation=data_config['interpolation'],
         params_thop=params,
-        average_batchtime = f'{batch_time.avg:.3f}s, {input.size(0) / batch_time.avg:>7.2f}/s, FPS={1/(batch_time.avg/args.batch_size):.1f}',
         codebook_utilization = f"{average_util:.2%}" if 'vq' in args.model else 'N/A'
     )
-    
-    # from torchstat import stat
-    # model = model.cpu().eval()
-    # stat(model, (3, 224, 224))
-    # _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
-    #    results['top1'], results['top1_err'], results['top5'], results['top5_err']))
 
     return results
 
@@ -500,37 +365,6 @@ _NON_IN1K_FILTERS = ['*_in21k', '*_in22k', '*in12k', '*_dino', '*fcmae', '*seer'
 def main():
     setup_default_logging()
     args = parser.parse_args()
-
-    if 'cifar100' in args.dataset:
-        args.data_dir = '../../pytorch-cifar100-master/data/' if not args.data_dir else args.data_dir
-        args.mean = CIFAR100_TRAIN_MEAN if not args.mean else args.mean
-        args.std = CIFAR100_TRAIN_STD if not args.std else args.std
-        args.num_classes = 100
-    elif 'cifar10' in args.dataset:
-        args.data_dir = '../../pytorch-cifar100-master/data/cifar10download/' if not args.data_dir else args.data_dir
-        args.mean = CIFAR10_MEAN if not args.mean else args.mean
-        args.std = CIFAR10_STD if not args.std else args.std
-        args.num_classes = 10
-    elif 'tiny-imagenet' in args.dataset:
-        args.data_dir = '../../tiny-imagenet-200/' if not args.data_dir else args.data_dir
-        args.mean = IMAGENET_DEFAULT_MEAN if not args.mean else args.mean#TINY_IMAGENET_MEAN
-        args.std = IMAGENET_DEFAULT_STD if not args.std else args.std#TINY_IMAGENET_STD
-        args.num_classes = 200
-    elif 'imagenet1k' in args.dataset:
-        args.data_dir = '../../ImageNet2012/' if not args.data_dir else args.data_dir
-        args.mean = IMAGENET_DEFAULT_MEAN if not args.mean else args.mean
-        args.std = IMAGENET_DEFAULT_STD if not args.std else args.std
-        args.num_classes = 1000
-    elif 'imagenet100' in args.dataset:
-        args.data_dir = '../../imagenet100/' if not args.data_dir else args.data_dir
-        args.mean = IMAGENET_DEFAULT_MEAN if not args.mean else args.mean
-        args.std = IMAGENET_DEFAULT_STD if not args.std else args.std
-        args.num_classes = 100
-    else:
-        raise NotImplementedError(f'Unknown dataset {args.dataset}')
-    _logger.info(
-            f'Data: {args.dataset}, num classes: {args.num_classes}')
-
     model_cfgs = []
     model_names = []
     if os.path.isdir(args.checkpoint):

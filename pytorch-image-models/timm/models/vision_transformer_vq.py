@@ -7,7 +7,7 @@ A PyTorch implement of Vision Transformers as described in:
 
 
 Acknowledgments:
-  vq ATTN 和 vq FFN 交替进行 (该版本为vq在Norm之后)
+  vq ATTN 和 vq FFN 交替进行 (该版本为vq在Norm之后,具有更好的字典激活 无字典坍塌现象)
 
 """
 import logging
@@ -30,7 +30,7 @@ from ._builder import build_model_with_cfg
 from ._manipulate import named_apply, checkpoint_seq, adapt_input_conv
 from ._registry import generate_default_cfgs, register_model, register_model_deprecations
 
-from timm.models.vectorquantize import VectorQuantizer_LossMask, VectorQuantizer_noLinear, VectorQuantizer_CosSim, VectorQuantizer, VectorQuantizer_LinearRebuild, VectorQuantizer_Sim, TokenToImageToToken, FSQ, FSQ_T,FSQ_trainableT, FSQ_AdaptiveQuant,FSQ_GumbelSoftmax
+from timm.models.vectorquantize import choose_vq
 
 __all__ = ['vqVisionTransformer']  # model_registry will add each entrypoint fn to this
 
@@ -70,7 +70,7 @@ class Attention(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
-        # print(f'Attention q mean:{q.mean().item()}, std: {q.std().item()}, k mean:{k.mean().item()} , std: {k.std().item()}, qk std:{(q @ k.transpose(-2, -1)).std().item()}, scale:{self.scale}   ')
+        # print(f'Attention q mean:{q.mean().item()}, k mean:{k.mean().item()} , q std: {q.std().item()}, , k std: {k.std().item()}, qk std:{(q @ k.transpose(-2, -1)).std().item()}, scale:{self.scale}   ')
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q, k, v,
@@ -88,7 +88,6 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-
 class vq_attn_Attention(nn.Module):
     fused_attn: Final[bool]
 
@@ -102,9 +101,9 @@ class vq_attn_Attention(nn.Module):
             proj_drop=0.,
             norm_layer=nn.LayerNorm,
 
-            vq_type='vq',
-            fsq_level = [7,7,7,7],
-            dic_n=1000, dic_dim=4, index=0, fsq_Tinit=-1
+            vq_type='fsq_qd',
+            fsq_level = [3,3,3,3],
+            dic_n=None, dic_dim=3, fsq_Tinit=1
     ):
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -120,29 +119,21 @@ class vq_attn_Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        self.is_pre_cal = False
-        if vq_type == 'vq':
-            self.vq = VectorQuantizer(dic_n, dim, dic_dim, index)
-        elif vq_type == 'tfsq':
-            # self.vq = FSQ_AdaptiveQuant(dic_n, dim, dic_dim, levels=fsq_level)
-            self.vq = FSQ_trainableT(dic_n, dim, dic_dim, index, levels=fsq_level, T=fsq_Tinit)
-            # self.vq = FSQ_GumbelSoftmax(dic_n, dim, dic_dim, levels=fsq_level)
-        elif vq_type == 'fsq':
-            # self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=1)
-            self.vq = FSQ(dic_n, dim, dic_dim, index, levels=fsq_level)
-    def reparameterize(self, vq_embedding):
+        self.token_wise_rep = False
+        self.vq = choose_vq(vq_type=vq_type, dic_n=dic_n, dim=dim, dic_dim=dic_dim, fsq_level=fsq_level, fsq_Tinit=fsq_Tinit)
+    def reparameterize(self, fixed_codebook):
         '''
-        vq_embedding: codebook->norm
+        fixed_codebook: codebook->norm
         '''
         print('using Attention reparameterize')
-        self.is_pre_cal = True
-        self.qkv_dict = nn.Embedding(vq_embedding.shape[0], 3*self.dim)
-        vq_embedding = vq_embedding.unsqueeze(0)
-        B, N, C = vq_embedding.shape
-        qkv = self.qkv(vq_embedding).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        self.token_wise_rep = True
+        self.qkv_dict = nn.Embedding(fixed_codebook.shape[0], 3*self.dim)
+        fixed_codebook = fixed_codebook.unsqueeze(0)
+        B, N, C = fixed_codebook.shape
+        qkv = self.qkv(fixed_codebook).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
-        # q = q * self.scale
+        q = q * self.scale
         q_flat = q.permute(0, 2, 1, 3).reshape(-1, self.dim)  # shape: [B*N*num_heads, dim]
         k_flat = k.permute(0, 2, 1, 3).reshape(-1, self.dim)
         v_flat = v.permute(0, 2, 1, 3).reshape(-1, self.dim)
@@ -154,28 +145,28 @@ class vq_attn_Attention(nn.Module):
 
         self.proj_codebook = nn.Embedding(self.vq.codebook_size, self.dim)
 
-        vq_dict = self.vq.reparameterize()
-        vq_dict = self.proj(vq_dict)
-        self.proj_codebook.weight.data.copy_(vq_dict)
+        fixed_codebook = self.vq.reparameterize()
+        reped_codebook = self.proj(fixed_codebook)
+        self.proj_codebook.weight.data.copy_(reped_codebook)
         del self.proj
 
     def forward(self, x, shape=None):
-        if self.is_pre_cal:
+        if self.token_wise_rep:
             B, N, C = shape
             
             embedding_index_map =  x
             qkv = self.qkv_dict(embedding_index_map).reshape(B, N, 3, self.num_heads, self.head_dim)
             q, k, v = qkv.unbind(dim=2)
-            q = q.permute(0, 2, 1, 3)  # [B, num_heads, N, head_dim]
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
+            q = q.permute(0, 2, 1, 3).contiguous()   # [B, num_heads, N, head_dim]
+            k = k.permute(0, 2, 1, 3).contiguous() 
+            v = v.permute(0, 2, 1, 3).contiguous() 
         else:
             B, N, C = x.shape
-            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4).contiguous() 
             q, k, v = qkv.unbind(0)
             q, k = self.q_norm(q), self.k_norm(k)
-            # print(f'VQ Attention q mean:{q.mean().item()}, std: {q.std().item()}, k mean:{k.mean().item()} , std: {k.std().item()}, qk std:{(q @ k.transpose(-2, -1)).std().item()}, scale:{self.scale}   ')
-            # q = q * self.scale
+            # print(f'VQ Attention q mean:{q.mean().item()}, k mean:{k.mean().item()} , q std: {q.std().item()}, k std: {k.std().item()}, qk std:{(q @ k.transpose(-2, -1)).std().item()}, scale:{self.scale}   ')
+            q = q * self.scale
             # print(f'q.shape before rep: {q.shape}')
         
 
@@ -185,7 +176,7 @@ class vq_attn_Attention(nn.Module):
         x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
-        if self.is_pre_cal:
+        if self.token_wise_rep:
             loss_dict = torch.tensor(0.0).cuda()
             embedding_index =  self.vq(x)
             x = self.proj_codebook(embedding_index)
@@ -220,12 +211,12 @@ class vq_ffn_Block(nn.Module):
             act_layer=nn.GELU,
             norm_layer=nn.LayerNorm,
             mlp_layer=Mlp,
-            dic_n=1024, dic_dim=8,
+            dic_n=1024, dic_dim=4,
             index=0,
             vq_type='vq',
-            fsq_level = [7,7,7,7],
+            fsq_level = [3,3,3,3],
             fsq_Tmax = 10,
-            fsq_Tinit=-1,
+            fsq_Tinit=1,
 
             layer_scale_init_value=1e-5
     ):
@@ -242,19 +233,7 @@ class vq_ffn_Block(nn.Module):
         )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        if vq_type == 'vq':
-            print(f'using vq, codebook: {dic_n, dic_dim}')
-            self.vq = VectorQuantizer(dic_n, dim, dic_dim, index)
-        elif vq_type == 'tfsq':
-            print(f'using FSQ_trainableT, levels={fsq_level}')
-            # self.vq = FSQ(dic_n, dim, dic_dim, index, levels=fsq_level) #先确定在wd0.1的条件下是128更高 还是512b更高
-            # self.vq = FSQ_AdaptiveQuant(dic_n, dim, dic_dim, levels=fsq_level)            
-            self.vq = FSQ_trainableT(dic_n, dim, dic_dim, index, levels=fsq_level, T=fsq_Tinit,T_max=fsq_Tmax )
-            # self.vq = FSQ_GumbelSoftmax(dic_n, dim, dic_dim, levels=fsq_level)
-        elif vq_type == 'fsq':
-            # self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=1)
-            self.vq = FSQ(dic_n, dim, dic_dim, index, levels=fsq_level)
-        
+        self.vq = choose_vq(vq_type=vq_type, dic_n=dic_n, dim=dim, dic_dim=dic_dim, fsq_level=fsq_level, fsq_Tinit=fsq_Tinit)
         self.norm2 = norm_layer(dim)
         self.mlp = mlp_layer(
             in_features=dim,
@@ -264,7 +243,7 @@ class vq_ffn_Block(nn.Module):
         )
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.is_pre_cal = False
+        self.token_wise_rep = False
         self.dict_n = dic_n
         self.dim = dim
 
@@ -275,12 +254,12 @@ class vq_ffn_Block(nn.Module):
 
     def reparameterize(self):
         print('using Block reparameterize')
-        self.is_pre_cal = True
-        self.pre_cal_dict = nn.Embedding(self.vq.codebook_size, self.dim)
-        vq_dict = self.vq.reparameterize()
-        x=self.mlp(vq_dict)
+        self.token_wise_rep = True
+        self.rep_codebook = nn.Embedding(self.vq.codebook_size, self.dim)
+        fixed_codebook = self.vq.reparameterize()
+        x=self.mlp(fixed_codebook)
         x = self.ls2(x)
-        self.pre_cal_dict.weight.data.copy_(x)
+        self.rep_codebook.weight.data.copy_(x)
         del self.mlp
         del self.ls2
     def forward(self, x):
@@ -290,11 +269,11 @@ class vq_ffn_Block(nn.Module):
         # feat = x # 蒸馏位置1
         x = input0 + x
         feat0 = x # 蒸馏位置2
-        x = self.norm2(x)
+        x = self.norm2(x) 
         loss_dict=torch.tensor(0.0).cuda()
-        if not self.training and self.is_pre_cal:
+        if not self.training and self.token_wise_rep:
             embedding_index =  self.vq(x)
-            z_q = self.pre_cal_dict(embedding_index)
+            z_q = self.rep_codebook(embedding_index)
             z_q = z_q.view(feat0.shape)
             return z_q+feat0, loss_dict
         else:
@@ -331,7 +310,7 @@ class vq_attn_Block(nn.Module):
             vq_type='vq',
             fsq_level = [7,7,7,7],
             fsq_Tmax = 10,
-            fsq_Tinit=-1
+            fsq_Tinit=1
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -346,7 +325,7 @@ class vq_attn_Block(nn.Module):
             # 暂时固定值
             vq_type=vq_type,
             fsq_level = fsq_level,
-            dic_n=1000, dic_dim=len(fsq_level), index=index,
+            dic_n=1000, dic_dim=len(fsq_level),
             fsq_Tinit = fsq_Tinit
             
             # dic_n=dic_n, dic_dim=dic_dim, index=index
@@ -363,31 +342,21 @@ class vq_attn_Block(nn.Module):
         )
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.is_pre_cal = False
+        self.token_wise_rep = False
         self.dict_n = dic_n
         self.dim = dim
-        if vq_type == 'vq':
-            self.vq = VectorQuantizer(dic_n, dim, dic_dim, index)
-        elif vq_type == 'tfsq':
-            print(f'using FSQ_trainableT in attn,  levels={fsq_level}')
-            # self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=2)
-            # self.vq = FSQ_AdaptiveQuant(dic_n, dim, dic_dim, levels=fsq_level)
-            self.vq = FSQ_trainableT(dic_n, dim, dic_dim, index, levels=fsq_level, T=fsq_Tinit,T_max=fsq_Tmax)
-            # self.vq = FSQ_GumbelSoftmax(dic_n, dim, dic_dim, levels=fsq_level)
-        elif vq_type == 'fsq':
-            # self.vq = FSQ_T(dic_n, dim, dic_dim, index, levels=fsq_level, T=1)
-            self.vq = FSQ(dic_n, dim, dic_dim, index, levels=fsq_level)
+        self.vq = choose_vq(vq_type=vq_type, dic_n=dic_n, dim=dim, dic_dim=dic_dim, fsq_level=fsq_level, fsq_Tinit=fsq_Tinit)
     def reparameterize(self):
         print('using Block reparameterize')
-        self.is_pre_cal = True
-        vq_dict = self.vq.reparameterize()
-        # print(f'vq_dict.shape: {vq_dict.shape}')
-        self.attn.reparameterize(vq_dict)
+        self.token_wise_rep = True
+        fixed_codebook = self.vq.reparameterize()
+        # print(f'fixed_codebook.shape: {fixed_codebook.shape}')
+        self.attn.reparameterize(fixed_codebook)
 
     def forward(self, x):
         input0 = x
         x = self.norm1(x)
-        if self.is_pre_cal:
+        if self.token_wise_rep:
             shape = x.shape
             qkv_vq_loss=torch.tensor(0.0).cuda()
             embedding_index =  self.vq(x)
@@ -519,7 +488,7 @@ class vqVisionTransformer(nn.Module):
             act_layer: Optional[LayerType] = None,
             block_fn: Type[nn.Module] = None,
             mlp_layer: Type[nn.Module] = Mlp,
-            dic_n=2048, dic_dim=64, vq_type='vq', fsq_level=[7,7,7,7], fsq_Tmax = 10, fsq_Tinit=-1
+            dic_n=None, dic_dim=4, vq_type='fsq_qd', fsq_level=[3,3,3,3], fsq_Tinit=1
     ):
         """
         Args:
@@ -616,8 +585,45 @@ class vqVisionTransformer(nn.Module):
         #         index=i,
         #         vq_type=vq_type,
         #         fsq_level = fsq_level,
-        #         fsq_Tmax = fsq_Tmax , fsq_Tinit=fsq_Tinit
+        #           fsq_Tinit=fsq_Tinit
         #     ) for i in range(depth)]
+        # ========== ATTN + (ffn & vq FFN alternately) ==========
+        # for i in range(depth):
+        #     if i%2==0:
+        #         block_list.append(Block(
+        #         dim=embed_dim,
+        #         num_heads=num_heads,
+        #         mlp_ratio=mlp_ratio,
+        #         qkv_bias=qkv_bias,
+        #         qk_norm=qk_norm,
+        #         init_values=init_values,
+        #         proj_drop=proj_drop_rate,
+        #         attn_drop=attn_drop_rate,
+        #         drop_path=dpr[i],
+        #         norm_layer=norm_layer,
+        #         act_layer=act_layer,
+        #         mlp_layer=mlp_layer
+        #     ) )
+        #     else:
+        #         block_list.append(vq_ffn_Block(
+        #         dim=embed_dim,
+        #         num_heads=num_heads,
+        #         mlp_ratio=mlp_ratio,
+        #         qkv_bias=qkv_bias,
+        #         qk_norm=qk_norm,
+        #         init_values=init_values,
+        #         proj_drop=proj_drop_rate,
+        #         attn_drop=attn_drop_rate,
+        #         drop_path=dpr[i],
+        #         norm_layer=norm_layer,
+        #         act_layer=act_layer,
+        #         mlp_layer=mlp_layer,
+        #         dic_n=dic_n, dic_dim=dic_dim,
+        #         index=i,
+        #         vq_type=vq_type,
+        #         fsq_level = fsq_level,
+        #           fsq_Tinit=fsq_Tinit
+        #     ))
         # ========== vq ATTN + vq FFN alternately ==========
         for i in range(depth):
             if i%2==0:
@@ -638,7 +644,7 @@ class vqVisionTransformer(nn.Module):
                 index=i,
                 vq_type=vq_type,
                 fsq_level = fsq_level,
-                fsq_Tmax = fsq_Tmax , fsq_Tinit=fsq_Tinit
+                  fsq_Tinit=fsq_Tinit
             ) )
             else:
                 block_list.append(vq_attn_Block(
@@ -658,7 +664,7 @@ class vqVisionTransformer(nn.Module):
                 index=i,
                 vq_type=vq_type,
                 fsq_level = fsq_level,
-                fsq_Tmax = fsq_Tmax , fsq_Tinit=fsq_Tinit
+                  fsq_Tinit=fsq_Tinit
             ))
 
         # ========== only vq FFN inmiddle ==========
@@ -696,7 +702,7 @@ class vqVisionTransformer(nn.Module):
         #         index=i,
         #         vq_type=vq_type,
         #         fsq_level = fsq_level,
-        #         fsq_Tmax = fsq_Tmax , fsq_Tinit=fsq_Tinit
+        #           fsq_Tinit=fsq_Tinit
         #     ))
 
 
@@ -728,11 +734,11 @@ class vqVisionTransformer(nn.Module):
         if weight_init != 'skip':
             self.init_weights(weight_init)
 
-        self.is_pre_cal = False
+        self.token_wise_rep = False
 
     def reparameterize(self):
         print('using Model reparameterize')
-        self.is_pre_cal = True
+        self.token_wise_rep = True
         for block in self.blocks:
             if hasattr(block, 'reparameterize'):
                 block.reparameterize()
@@ -754,6 +760,28 @@ class vqVisionTransformer(nn.Module):
     def _init_weights(self, m):
         # this fn left here for compat with downstream users
         init_weights_vit_timm(m)
+    @torch.jit.ignore
+    def print_codebook_utilization(self):
+        sum_util = 0.0
+        average_util = 0.0
+        count = 0
+        found_modules = []  # 用于记录找到的模块及其路径
+        # 递归遍历所有子模块
+        for module_name, module in self.named_modules():
+            # 检查模块是否是 VQ 实例（根据您的类名调整条件）
+            # 例如，如果您的VQ类名为 VectorQuantizer：
+            if hasattr(module, 'codebook_meter'): # 或者使用 isinstance(module, VectorQuantizer)
+                utilization = module.codebook_meter.utilization # 注意：这里是属性，不是方法调用
+                print(f'VQ Module [{module_name}] Codebook Utilization: {utilization * 100:.2f}%')
+                found_modules.append(module_name)
+                sum_util += utilization
+                count += 1
+        if count > 0:
+            average_util = sum_util / count
+            print(f'Average VQ Codebook Utilization (across {count} modules): {average_util*100:.2f}%')
+        else:
+            print('No VQ modules with codebook meters found.')
+        return average_util
 
     @torch.jit.ignore()
     def load_pretrained(self, checkpoint_path, prefix=''):
@@ -910,7 +938,7 @@ class vqVisionTransformer(nn.Module):
             x = self.blocks[i](x)
             # print(f' Block index: {i}')
             if isinstance(x, tuple) and len(x) > 1:
-                if not self.training and self.is_pre_cal:
+                if not self.training and self.token_wise_rep:
                     index_record.append(x[1])
                 else:
                     loss_dict.append(x[1])
@@ -2039,7 +2067,7 @@ def vqvit_small_patch32_224(pretrained=False, **kwargs) -> vqVisionTransformer:
 def vqvit_small_patch32_384(pretrained=False, **kwargs) -> vqVisionTransformer:
     """ ViT-Small (ViT-S/32) at 384x384.
     """
-    model_args = dict(patch_size=32, embed_dim=384, depth=12, num_heads=6)
+    model_args = dict(patch_size=32, embed_dim=384, depth=12, num_heads=6, img_size=384)
     model = _create_vision_transformer('vqvit_small_patch32_384', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 

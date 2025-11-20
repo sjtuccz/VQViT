@@ -527,7 +527,7 @@ class RegNet(nn.Module):
     def forward_head(self, x, pre_logits: bool = False):
         return self.head(x, pre_logits=pre_logits)
 
-    def forward(self, x):
+    def forward(self, x, is_feat=False):
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x

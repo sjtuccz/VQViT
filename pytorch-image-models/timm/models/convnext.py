@@ -416,7 +416,7 @@ class ConvNeXt(nn.Module):
     def forward_head(self, x, pre_logits: bool = False):
         return self.head(x, pre_logits=True) if pre_logits else self.head(x)
 
-    def forward(self, x):
+    def forward(self, x, is_feat=False):
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x

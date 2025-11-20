@@ -30,8 +30,9 @@ from ._features_fx import register_notrace_function
 from ._manipulate import checkpoint_seq, named_apply
 from ._registry import generate_default_cfgs, register_model, register_model_deprecations
 from .vision_transformer import get_init_weights_vit
+from timm.models.vectorquantize import choose_vq
 
-__all__ = ['SwinTransformer']  # model_registry will add each entrypoint fn to this
+__all__ = ['vqSwinTransformer']  # model_registry will add each entrypoint fn to this
 
 _logger = logging.getLogger(__name__)
 
@@ -135,6 +136,7 @@ class WindowAttention(nn.Module):
         self.qkv = nn.Linear(dim, attn_dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(attn_dim, dim)
+        print('attn dim:', attn_dim, ' proj dim:', dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
         trunc_normal_(self.relative_position_bias_table, std=.02)
@@ -153,36 +155,37 @@ class WindowAttention(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4).contiguous()
         q, k, v = qkv.unbind(0)
 
-        # if self.fused_attn:
-        #     attn_mask = self._get_rel_pos_bias()
-        #     if mask is not None:
-        #         num_win = mask.shape[0]
-        #         mask = mask.view(1, num_win, 1, N, N).expand(B_ // num_win, -1, self.num_heads, -1, -1)
-        #         attn_mask = attn_mask + mask.reshape(-1, self.num_heads, N, N)
-        #     x = torch.nn.functional.scaled_dot_product_attention(
-        #         q, k, v,
-        #         attn_mask=attn_mask,
-        #         dropout_p=self.attn_drop.p if self.training else 0.,
-        #     )
-        # else:
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-        attn = attn + self._get_rel_pos_bias()
-        if mask is not None:
-            num_win = mask.shape[0]
-            attn = attn.view(-1, num_win, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-        attn = self.softmax(attn)
-        attn = self.attn_drop(attn)
-        x = attn @ v
+        if self.fused_attn:
+            attn_mask = self._get_rel_pos_bias()
+            if mask is not None:
+                num_win = mask.shape[0]
+                mask = mask.view(1, num_win, 1, N, N).expand(B_ // num_win, -1, self.num_heads, -1, -1)
+                attn_mask = attn_mask + mask.reshape(-1, self.num_heads, N, N)
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn + self._get_rel_pos_bias()
+            if mask is not None:
+                num_win = mask.shape[0]
+                attn = attn.view(-1, num_win, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+                attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+            attn = self.attn_drop(attn)
+            x = attn @ v
 
         x = x.transpose(1, 2).reshape(B_, N, -1)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+    
     @torch.jit.ignore
     def flops(self, N):
         # calculate flops for 1 window with token length of N
@@ -195,6 +198,165 @@ class WindowAttention(nn.Module):
         flops += self.num_heads * N * N * (self.dim // self.num_heads)
         # x = self.proj(x)
         flops += N * self.dim * self.dim
+        return flops
+class vqWindowAttention(nn.Module):
+    """VQ: Window based multi-head self attention (W-MSA) module with relative position bias.
+    It supports shifted and non-shifted windows.
+    """
+    fused_attn: torch.jit.Final[bool]
+
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            head_dim: Optional[int] = None,
+            window_size: _int_or_tuple_2_t = 7,
+            qkv_bias: bool = True,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+
+            vq_type='fsq_qd',
+            fsq_level = [3,3,3,3],
+            dic_n=None, dic_dim=3, fsq_Tinit=1
+    ):
+        """
+        Args:
+            dim: Number of input channels.
+            num_heads: Number of attention heads.
+            head_dim: Number of channels per head (dim // num_heads if not set)
+            window_size: The height and width of the window.
+            qkv_bias:  If True, add a learnable bias to query, key, value.
+            attn_drop: Dropout ratio of attention weight.
+            proj_drop: Dropout ratio of output.
+        """
+        super().__init__()
+        self.dim = dim
+        self.window_size = to_2tuple(window_size)  # Wh, Ww
+        win_h, win_w = self.window_size
+        self.window_area = win_h * win_w
+        self.num_heads = num_heads
+        head_dim = head_dim or dim // num_heads
+        self.head_dim = head_dim
+        attn_dim = head_dim * num_heads
+        self.scale = head_dim ** -0.5
+        self.fused_attn = use_fused_attn(experimental=True)  # NOTE not tested for prime-time yet
+        # print('WindowAttention: using fused_attn = ', self.fused_attn)
+
+        # define a parameter table of relative position bias, shape: 2*Wh-1 * 2*Ww-1, nH
+        self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * win_h - 1) * (2 * win_w - 1), num_heads))
+
+        # get pair-wise relative position index for each token inside the window
+        self.register_buffer("relative_position_index", get_relative_position_index(win_h, win_w), persistent=False)
+
+        self.qkv = nn.Linear(dim, attn_dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(attn_dim, dim)
+        
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+        self.token_wise_rep = False
+        self.qkv_vq = choose_vq(vq_type=vq_type, dic_n=dic_n, dim=dim, dic_dim=dic_dim, fsq_level=fsq_level, fsq_Tinit=fsq_Tinit)
+        self.proj_vq = choose_vq(vq_type=vq_type, dic_n=dic_n, dim=attn_dim, dic_dim=dic_dim, fsq_level=fsq_level, fsq_Tinit=fsq_Tinit)
+        self.attn_dim = attn_dim
+    def _get_rel_pos_bias(self) -> torch.Tensor:
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)].view(self.window_area, self.window_area, -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        return relative_position_bias.unsqueeze(0)
+
+    def forward(self, x, mask: Optional[torch.Tensor] = None):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        B_, N, C = x.shape
+        z = self.qkv_vq(x)
+        if isinstance(z, tuple):
+            z= z[0]
+        if self.token_wise_rep:
+            index_map = z
+            qkv = self.qkv_codebook(index_map).reshape(B_, N, 3, self.num_heads, -1)
+            q, k, v = qkv.unbind(dim=2)
+            q = q.permute(0, 2, 1, 3).contiguous()  # [B, num_heads, N, head_dim]
+            k = k.permute(0, 2, 1, 3).contiguous() 
+            v = v.permute(0, 2, 1, 3).contiguous() 
+        else: 
+            qkv = self.qkv(z).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4).contiguous() 
+            q, k, v = qkv.unbind(0)
+            q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+        attn = attn + self._get_rel_pos_bias()
+        if mask is not None:
+            num_win = mask.shape[0]
+            attn = attn.view(-1, num_win, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+        attn = self.softmax(attn)
+        attn = self.attn_drop(attn)
+        x = attn @ v
+
+        x = x.transpose(1, 2).reshape(B_, N, -1)
+        z = self.proj_vq(x)
+        if isinstance(z, tuple):
+            z= z[0]
+        if self.token_wise_rep:
+            index_map = z
+            x = self.proj_codebook(index_map)
+        else:
+            x = self.proj(z)
+            x = self.proj_drop(x)
+        return x
+    
+    def reparameterize(self):
+        print('using attn reparameterize')
+        self.token_wise_rep = True
+
+        self.qkv_codebook = nn.Embedding(self.qkv_vq.codebook_size, self.attn_dim*3)
+        fixed_codebook_qkv = self.qkv_vq.reparameterize()
+        fixed_codebook_qkv = fixed_codebook_qkv.unsqueeze(0)
+        B_, N, C = fixed_codebook_qkv.shape
+        qkv = self.qkv(fixed_codebook_qkv).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4).contiguous() 
+        q, k, v = qkv.unbind(0)
+        q = q * self.scale
+        q_flat = q.permute(0, 2, 1, 3).reshape(-1, self.dim).contiguous()   # shape: [B*N*num_heads, dim]
+        k_flat = k.permute(0, 2, 1, 3).reshape(-1, self.dim).contiguous() 
+        v_flat = v.permute(0, 2, 1, 3).reshape(-1, self.dim).contiguous() 
+        self.qkv_codebook.weight.data.copy_(
+            torch.cat([q_flat, k_flat, v_flat], dim=1).reshape(-1, self.attn_dim*3)
+        )
+        del self.qkv, self.scale
+
+        self.proj_codebook = nn.Embedding(self.proj_vq.codebook_size, self.dim)
+        fixed_codebook_proj = self.proj_vq.reparameterize()
+        reped_codebook_proj = self.proj(fixed_codebook_proj)
+        self.proj_codebook.weight.data.copy_(reped_codebook_proj)
+        del self.proj
+
+    @torch.jit.ignore
+    def flops(self, N):
+         #N, window_size*window_size, C
+         # calculate flops for 1 window with token length of N
+        flops = 0
+        # dim up & dim down linear in 2 TQ block
+        if not self.token_wise_rep:
+            flops += 2 * N * self.dim * self.qkv_vq.codebook_dim
+            flops += 2 * N * self.attn_dim * self.proj_vq.codebook_dim
+            # qkv = self.qkv(x)
+            flops += N * self.dim * 3 * self.dim
+            # attn = (q @ k.transpose(-2, -1))
+            flops += self.num_heads * N * (self.dim // self.num_heads) * N
+            #  x = (attn @ v)
+            flops += self.num_heads * N * N * (self.dim // self.num_heads)
+            # x = self.proj(x)
+            flops += N * self.dim * self.dim
+        else:
+            flops += N * self.dim * self.qkv_vq.codebook_dim
+            flops += N * self.attn_dim * self.proj_vq.codebook_dim
+            flops += self.num_heads * N * (self.dim // self.num_heads) * N
+            flops += self.num_heads * N * N * (self.dim // self.num_heads)
         return flops
 
 class SwinTransformerBlock(nn.Module):
@@ -334,11 +496,11 @@ class SwinTransformerBlock(nn.Module):
     def forward(self, x):
         B, H, W, C = x.shape
         x = x + self.drop_path1(self._attn(self.norm1(x)))
-        x = x.reshape(B, -1, C)
+        x = x.reshape(B, -1, C) # B H*W C == N L C
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         x = x.reshape(B, H, W, C)
         return x
-
+    
     @torch.jit.ignore
     def flops(self):
         flops = 0
@@ -353,6 +515,372 @@ class SwinTransformerBlock(nn.Module):
         # norm2
         flops += self.dim * H * W
         return flops
+    
+class SwinTransformerBlock_VQ_ATTN(nn.Module):
+    """ Swin Transformer Block.
+    """
+
+    def __init__(
+            self,
+            dim: int,
+            input_resolution: _int_or_tuple_2_t,
+            num_heads: int = 4,
+            head_dim: Optional[int] = None,
+            window_size: _int_or_tuple_2_t = 7,
+            shift_size: int = 0,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = True,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            drop_path: float = 0.,
+            act_layer: Callable = nn.GELU,
+            norm_layer: Callable = nn.LayerNorm,
+
+            vq_type='fsq_qd',
+            fsq_level = [3,3,3,3],
+            dic_n=None, dic_dim=3, fsq_Tinit=1
+    ):
+        """
+        Args:
+            dim: Number of input channels.
+            input_resolution: Input resolution.
+            window_size: Window size.
+            num_heads: Number of attention heads.
+            head_dim: Enforce the number of channels per head
+            shift_size: Shift size for SW-MSA.
+            mlp_ratio: Ratio of mlp hidden dim to embedding dim.
+            qkv_bias: If True, add a learnable bias to query, key, value.
+            proj_drop: Dropout rate.
+            attn_drop: Attention dropout rate.
+            drop_path: Stochastic depth rate.
+            act_layer: Activation layer.
+            norm_layer: Normalization layer.
+        """
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        ws, ss = self._calc_window_shift(window_size, shift_size)
+        self.window_size: Tuple[int, int] = ws
+        self.shift_size: Tuple[int, int] = ss
+        self.window_area = self.window_size[0] * self.window_size[1]
+        self.mlp_ratio = mlp_ratio
+
+        self.norm1 = norm_layer(dim)
+        # self.attn = WindowAttention(
+        #     dim,
+        #     num_heads=num_heads,
+        #     head_dim=head_dim,
+        #     window_size=to_2tuple(self.window_size),
+        #     qkv_bias=qkv_bias,
+        #     attn_drop=attn_drop,
+        #     proj_drop=proj_drop,
+        # )
+        self.attn = vqWindowAttention(
+            dim,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            window_size=to_2tuple(self.window_size),
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+
+            vq_type=vq_type,
+            fsq_level = fsq_level,
+            dic_n=dic_n, dic_dim=dic_dim, fsq_Tinit=fsq_Tinit
+        )
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
+        )
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.token_wise_rep = False
+        if any(self.shift_size):
+            # calculate attention mask for SW-MSA
+            H, W = self.input_resolution
+            H = math.ceil(H / self.window_size[0]) * self.window_size[0]
+            W = math.ceil(W / self.window_size[1]) * self.window_size[1]
+            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+            cnt = 0
+            for h in (
+                    slice(0, -self.window_size[0]),
+                    slice(-self.window_size[0], -self.shift_size[0]),
+                    slice(-self.shift_size[0], None)):
+                for w in (
+                        slice(0, -self.window_size[1]),
+                        slice(-self.window_size[1], -self.shift_size[1]),
+                        slice(-self.shift_size[1], None)):
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+            mask_windows = mask_windows.view(-1, self.window_area)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        else:
+            attn_mask = None
+
+        self.register_buffer("attn_mask", attn_mask, persistent=False)
+
+    def _calc_window_shift(self, target_window_size, target_shift_size) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        target_window_size = to_2tuple(target_window_size)
+        target_shift_size = to_2tuple(target_shift_size)
+        window_size = [r if r <= w else w for r, w in zip(self.input_resolution, target_window_size)]
+        shift_size = [0 if r <= w else s for r, w, s in zip(self.input_resolution, window_size, target_shift_size)]
+        return tuple(window_size), tuple(shift_size)
+
+    def _attn(self, x):
+        B, H, W, C = x.shape
+
+        # cyclic shift
+        has_shift = any(self.shift_size)
+        if has_shift:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size[0], -self.shift_size[1]), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        # pad for resolution not divisible by window size
+        pad_h = (self.window_size[0] - H % self.window_size[0]) % self.window_size[0]
+        pad_w = (self.window_size[1] - W % self.window_size[1]) % self.window_size[1]
+        shifted_x = torch.nn.functional.pad(shifted_x, (0, 0, 0, pad_w, 0, pad_h))
+        Hp, Wp = H + pad_h, W + pad_w
+
+        # partition windows
+        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+        x_windows = x_windows.view(-1, self.window_area, C)  # nW*B, window_size*window_size, C
+        # print('x_windows shape:', x_windows.shape)
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, self.window_size[0], self.window_size[1], C)
+        shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  # B H' W' C
+        shifted_x = shifted_x[:, :H, :W, :].contiguous()
+
+        # reverse cyclic shift
+        if has_shift:
+            x = torch.roll(shifted_x, shifts=self.shift_size, dims=(1, 2))
+        else:
+            x = shifted_x
+        return x
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+        x = x + self.drop_path1(self._attn(self.norm1(x)))
+        x = x.reshape(B, -1, C) # B H*W C == N L C
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        x = x.reshape(B, H, W, C)
+        return x
+    
+    @torch.jit.ignore
+    def flops(self):
+        flops = 0
+        H, W = self.input_resolution
+        # norm1
+        flops += self.dim * H * W
+        # W-MSA/SW-MSA
+        nW = H * W / self.window_size[0] / self.window_size[1]
+        # print('windows num:' ,self.window_size[0] * self.window_size[1], 'nW:', nW)
+        flops += nW * self.attn.flops(self.window_size[0] * self.window_size[1])
+        # mlp
+        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
+        # norm2
+        flops += self.dim * H * W
+        return flops
+
+    def reparameterize(self):
+        if hasattr(self.attn, 'reparameterize'):
+            self.token_wise_rep = True
+            self.attn.reparameterize()
+    
+class SwinTransformerBlock_VQ_FFN(nn.Module):
+    """ Swin Transformer Block.
+    """
+
+    def __init__(
+            self,
+            dim: int,
+            input_resolution: _int_or_tuple_2_t,
+            num_heads: int = 4,
+            head_dim: Optional[int] = None,
+            window_size: _int_or_tuple_2_t = 7,
+            shift_size: int = 0,
+            mlp_ratio: float = 4.,
+            qkv_bias: bool = True,
+            proj_drop: float = 0.,
+            attn_drop: float = 0.,
+            drop_path: float = 0.,
+            act_layer: Callable = nn.GELU,
+            norm_layer: Callable = nn.LayerNorm,
+
+            vq_type='fsq_qd',fsq_level = [3,3,3,3],
+            dic_n=None, dic_dim=4, fsq_Tinit=1
+    ):
+        """
+        Args:
+            dim: Number of input channels.
+            input_resolution: Input resolution.
+            window_size: Window size.
+            num_heads: Number of attention heads.
+            head_dim: Enforce the number of channels per head
+            shift_size: Shift size for SW-MSA.
+            mlp_ratio: Ratio of mlp hidden dim to embedding dim.
+            qkv_bias: If True, add a learnable bias to query, key, value.
+            proj_drop: Dropout rate.
+            attn_drop: Attention dropout rate.
+            drop_path: Stochastic depth rate.
+            act_layer: Activation layer.
+            norm_layer: Normalization layer.
+        """
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        ws, ss = self._calc_window_shift(window_size, shift_size)
+        self.window_size: Tuple[int, int] = ws
+        self.shift_size: Tuple[int, int] = ss
+        self.window_area = self.window_size[0] * self.window_size[1]
+        self.mlp_ratio = mlp_ratio
+
+        self.norm1 = norm_layer(dim)
+        self.attn = WindowAttention(
+            dim,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            window_size=to_2tuple(self.window_size),
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
+        )
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.vq = choose_vq(vq_type=vq_type, dic_n=dic_n, dim=dim, dic_dim=dic_dim, fsq_level=fsq_level, fsq_Tinit=fsq_Tinit)
+        self.token_wise_rep = False
+        if any(self.shift_size):
+            # calculate attention mask for SW-MSA
+            H, W = self.input_resolution
+            H = math.ceil(H / self.window_size[0]) * self.window_size[0]
+            W = math.ceil(W / self.window_size[1]) * self.window_size[1]
+            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+            cnt = 0
+            for h in (
+                    slice(0, -self.window_size[0]),
+                    slice(-self.window_size[0], -self.shift_size[0]),
+                    slice(-self.shift_size[0], None)):
+                for w in (
+                        slice(0, -self.window_size[1]),
+                        slice(-self.window_size[1], -self.shift_size[1]),
+                        slice(-self.shift_size[1], None)):
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+            mask_windows = mask_windows.view(-1, self.window_area)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        else:
+            attn_mask = None
+
+        self.register_buffer("attn_mask", attn_mask, persistent=False)
+
+    def _calc_window_shift(self, target_window_size, target_shift_size) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        target_window_size = to_2tuple(target_window_size)
+        target_shift_size = to_2tuple(target_shift_size)
+        window_size = [r if r <= w else w for r, w in zip(self.input_resolution, target_window_size)]
+        shift_size = [0 if r <= w else s for r, w, s in zip(self.input_resolution, window_size, target_shift_size)]
+        return tuple(window_size), tuple(shift_size)
+
+    def _attn(self, x):
+        B, H, W, C = x.shape
+
+        # cyclic shift
+        has_shift = any(self.shift_size)
+        if has_shift:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size[0], -self.shift_size[1]), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        # pad for resolution not divisible by window size
+        pad_h = (self.window_size[0] - H % self.window_size[0]) % self.window_size[0]
+        pad_w = (self.window_size[1] - W % self.window_size[1]) % self.window_size[1]
+        shifted_x = torch.nn.functional.pad(shifted_x, (0, 0, 0, pad_w, 0, pad_h))
+        Hp, Wp = H + pad_h, W + pad_w
+
+        # partition windows
+        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+        x_windows = x_windows.view(-1, self.window_area, C)  # nW*B, window_size*window_size, C
+
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, self.window_size[0], self.window_size[1], C)
+        shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  # B H' W' C
+        shifted_x = shifted_x[:, :H, :W, :].contiguous()
+
+        # reverse cyclic shift
+        if has_shift:
+            x = torch.roll(shifted_x, shifts=self.shift_size, dims=(1, 2))
+        else:
+            x = shifted_x
+        return x
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+        x = x + self.drop_path1(self._attn(self.norm1(x)))
+        x = x.reshape(B, -1, C) # B H*W C == N L C
+        # VQ FFN
+        feat = x
+        x = self.norm2(x)
+        if not self.training and self.token_wise_rep:
+            embedding_index =  self.vq(x)
+            z_q = self.rep_codebook(embedding_index)
+            x = feat + z_q
+        else:
+            x = self.vq(x)
+            if isinstance(x, tuple):
+                x = x[0]
+            x = feat + self.drop_path2(self.mlp(x))
+        x = x.reshape(B, H, W, C)
+        return x
+    
+    @torch.jit.ignore
+    def flops(self):
+        flops = 0
+        H, W = self.input_resolution
+        # norm1
+        flops += self.dim * H * W
+        # W-MSA/SW-MSA
+        nW = H * W / self.window_size[0] / self.window_size[1]
+        flops += nW * self.attn.flops(self.window_size[0] * self.window_size[1])
+        if not self.token_wise_rep:
+            flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio # mlp
+            flops += 2 * H * W *self.dim * self.vq.codebook_dim# dim down & dim up linear in TQ block
+        else:
+            flops += H * W *self.dim * self.vq.codebook_dim # dim down linear in TQ block
+        # norm2
+        flops += self.dim * H * W
+        return flops
+    
+    def reparameterize(self):
+        print('using FFN reparameterize')
+        self.token_wise_rep = True
+        self.rep_codebook = nn.Embedding(self.vq.codebook_size, self.dim)
+        fixed_codebook = self.vq.reparameterize()
+        x=self.mlp(fixed_codebook)
+        self.rep_codebook.weight.data.copy_(x)
+        del self.mlp
+
 
 class PatchMerging(nn.Module):
     """ Patch Merging Layer.
@@ -381,7 +909,7 @@ class PatchMerging(nn.Module):
         self.input_resolution = (H, W)
         _assert(H % 2 == 0, f"x height ({H}) is not even.")
         _assert(W % 2 == 0, f"x width ({W}) is not even.")
-        x = x.reshape(B, H // 2, 2, W // 2, 2, C).permute(0, 1, 3, 4, 2, 5).flatten(3)
+        x = x.reshape(B, H // 2, 2, W // 2, 2, C).permute(0, 1, 3, 4, 2, 5).flatten(3).contiguous() 
         x = self.norm(x)
         x = self.reduction(x)
         return x
@@ -390,6 +918,7 @@ class PatchMerging(nn.Module):
         flops = H * W * self.dim
         flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
         return flops
+
 
 class SwinTransformerStage(nn.Module):
     """ A basic Swin Transformer layer for one stage.
@@ -411,6 +940,9 @@ class SwinTransformerStage(nn.Module):
             attn_drop: float = 0.,
             drop_path: Union[List[float], float] = 0.,
             norm_layer: Callable = nn.LayerNorm,
+
+            vq_type='fsq_qd',fsq_level = [3,3,3,3],
+            dic_n=None, dic_dim=4, fsq_Tinit=1
     ):
         """
         Args:
@@ -449,8 +981,10 @@ class SwinTransformerStage(nn.Module):
             self.downsample = nn.Identity()
 
         # build blocks
-        self.blocks = nn.Sequential(*[
-            SwinTransformerBlock(
+        blocks=[]
+        for i in range(depth):
+            if i%2==0:
+                blocks.append(SwinTransformerBlock_VQ_ATTN(
                 dim=out_dim,
                 input_resolution=self.output_resolution,
                 num_heads=num_heads,
@@ -463,8 +997,28 @@ class SwinTransformerStage(nn.Module):
                 attn_drop=attn_drop,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                 norm_layer=norm_layer,
-            )
-            for i in range(depth)])
+
+                vq_type=vq_type, fsq_level = fsq_level,
+                dic_n=dic_n, dic_dim=dic_dim, fsq_Tinit=fsq_Tinit
+            ))
+            else:
+                blocks.append(SwinTransformerBlock_VQ_FFN(
+                dim=out_dim,
+                input_resolution=self.output_resolution,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                window_size=window_size,
+                shift_size=0 if (i % 2 == 0) else shift_size,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                proj_drop=proj_drop,
+                attn_drop=attn_drop,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=norm_layer,
+                vq_type=vq_type, fsq_level = fsq_level,
+                dic_n=dic_n, dic_dim=dic_dim, fsq_Tinit=fsq_Tinit
+            ))
+        self.blocks = nn.Sequential(*blocks)
 
     def forward(self, x):
         x = self.downsample(x)
@@ -475,7 +1029,6 @@ class SwinTransformerStage(nn.Module):
             x = self.blocks(x)
         return x
     
-    @torch.jit.ignore
     def flops(self):
         flops = 0
         for blk in self.blocks:
@@ -485,10 +1038,10 @@ class SwinTransformerStage(nn.Module):
             flops += self.downsample.flops()
         return flops
 
-class SwinTransformer(nn.Module):
-    """ Swin Transformer
+class vqSwinTransformer(nn.Module):
+    """ VQ Swin Transformer
 
-    A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+    Modified from  : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
           https://arxiv.org/pdf/2103.14030
     """
 
@@ -513,6 +1066,9 @@ class SwinTransformer(nn.Module):
             embed_layer: Callable = PatchEmbed,
             norm_layer: Union[str, Callable] = nn.LayerNorm,
             weight_init: str = '',
+
+            vq_type='fsq_qd',fsq_level = [3,3,3,3],
+            dic_n=None, dic_dim=4, fsq_Tinit=1,
             **kwargs,
     ):
         """
@@ -591,6 +1147,9 @@ class SwinTransformer(nn.Module):
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[i],
                 norm_layer=norm_layer,
+
+                vq_type=vq_type, fsq_level = fsq_level,
+                dic_n=dic_n, dic_dim=dic_dim, fsq_Tinit=fsq_Tinit
             )]
             in_dim = out_dim
             if i > 0:
@@ -608,7 +1167,8 @@ class SwinTransformer(nn.Module):
         )
         if weight_init != 'skip':
             self.init_weights(weight_init)
-
+        
+        self.token_wise_rep = False
     @torch.jit.ignore
     def init_weights(self, mode=''):
         assert mode in ('jax', 'jax_nlhb', 'moco', '')
@@ -661,6 +1221,14 @@ class SwinTransformer(nn.Module):
         x = self.forward_head(x)
         return x
 
+    def reparameterize(self):
+        print('using Block reparameterize')
+        self.token_wise_rep = True
+        for stage in self.layers:
+            for block in stage.blocks:
+                if hasattr(block, 'reparameterize'):
+                    block.reparameterize()
+
     def flops(self):
         flops = 0
         flops += self.patch_embed.flops()
@@ -670,7 +1238,26 @@ class SwinTransformer(nn.Module):
         flops += self.num_features * patches_resolution[0] * patches_resolution[1] // (2 ** self.num_layers)
         flops += self.num_features * self.num_classes
         return flops
-
+    @torch.jit.ignore
+    def print_codebook_utilization(self):
+        sum_util = 0.0
+        average_util = 0.0
+        count = 0
+        found_modules = []  # 用于记录找到的模块及其路径
+        # 递归遍历所有子模块
+        for module_name, module in self.named_modules():
+            if hasattr(module, 'codebook_meter'): 
+                utilization = module.codebook_meter.utilization 
+                print(f'VQ Module [{module_name}] Codebook Utilization: {utilization * 100:.2f}%')
+                found_modules.append(module_name)
+                sum_util += utilization
+                count += 1
+        if count > 0:
+            average_util = sum_util / count
+            print(f'Average VQ Codebook Utilization (across {count} modules): {average_util*100:.2f}%')
+        else:
+            print('No VQ modules with codebook meters found.')
+        return average_util
 def checkpoint_filter_fn(state_dict, model):
     """ convert patch embedding weight from manual patchify + linear proj to conv"""
     old_weights = True
@@ -717,7 +1304,7 @@ def _create_swin_transformer(variant, pretrained=False, **kwargs):
     out_indices = kwargs.pop('out_indices', default_out_indices)
 
     model = build_model_with_cfg(
-        SwinTransformer, variant, pretrained,
+        vqSwinTransformer, variant, pretrained,
         pretrained_filter_fn=checkpoint_filter_fn,
         feature_cfg=dict(flatten_sequential=True, out_indices=out_indices),
         **kwargs)
@@ -808,93 +1395,96 @@ default_cfgs = generate_default_cfgs({
     'swin_s3_base_224.ms_in1k': _cfg(
         hf_hub_id='timm/',
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/s3_b-a1e95db4.pth'),
+
+    #vq swin
+    'vqswin_tiny_patch4_window7_224': _cfg(crop_pct=0.875),
 })
 
 
 @register_model
-def swin_tiny_patch4_window7_224(pretrained=False, **kwargs) -> SwinTransformer:
+def vqswin_tiny_patch4_window7_224(pretrained=False, **kwargs) -> vqSwinTransformer:
     """ Swin-T @ 224x224, trained ImageNet-1k
     """
     model_args = dict(patch_size=4, window_size=7, embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24))
     return _create_swin_transformer(
-        'swin_tiny_patch4_window7_224', pretrained=pretrained, **dict(model_args, **kwargs))
+        'vqswin_tiny_patch4_window7_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
-@register_model
-def swin_small_patch4_window7_224(pretrained=False, **kwargs) -> SwinTransformer:
-    """ Swin-S @ 224x224
-    """
-    model_args = dict(patch_size=4, window_size=7, embed_dim=96, depths=(2, 2, 18, 2), num_heads=(3, 6, 12, 24))
-    return _create_swin_transformer(
-        'swin_small_patch4_window7_224', pretrained=pretrained, **dict(model_args, **kwargs))
+# @register_model
+# def swin_small_patch4_window7_224(pretrained=False, **kwargs) -> SwinTransformer:
+#     """ Swin-S @ 224x224
+#     """
+#     model_args = dict(patch_size=4, window_size=7, embed_dim=96, depths=(2, 2, 18, 2), num_heads=(3, 6, 12, 24))
+#     return _create_swin_transformer(
+#         'swin_small_patch4_window7_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
-@register_model
-def swin_base_patch4_window7_224(pretrained=False, **kwargs) -> SwinTransformer:
-    """ Swin-B @ 224x224
-    """
-    model_args = dict(patch_size=4, window_size=7, embed_dim=128, depths=(2, 2, 18, 2), num_heads=(4, 8, 16, 32))
-    return _create_swin_transformer(
-        'swin_base_patch4_window7_224', pretrained=pretrained, **dict(model_args, **kwargs))
+# @register_model
+# def swin_base_patch4_window7_224(pretrained=False, **kwargs) -> SwinTransformer:
+#     """ Swin-B @ 224x224
+#     """
+#     model_args = dict(patch_size=4, window_size=7, embed_dim=128, depths=(2, 2, 18, 2), num_heads=(4, 8, 16, 32))
+#     return _create_swin_transformer(
+#         'swin_base_patch4_window7_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
-@register_model
-def swin_base_patch4_window12_384(pretrained=False, **kwargs) -> SwinTransformer:
-    """ Swin-B @ 384x384
-    """
-    model_args = dict(patch_size=4, window_size=12, embed_dim=128, depths=(2, 2, 18, 2), num_heads=(4, 8, 16, 32))
-    return _create_swin_transformer(
-        'swin_base_patch4_window12_384', pretrained=pretrained, **dict(model_args, **kwargs))
+# @register_model
+# def swin_base_patch4_window12_384(pretrained=False, **kwargs) -> SwinTransformer:
+#     """ Swin-B @ 384x384
+#     """
+#     model_args = dict(patch_size=4, window_size=12, embed_dim=128, depths=(2, 2, 18, 2), num_heads=(4, 8, 16, 32))
+#     return _create_swin_transformer(
+#         'swin_base_patch4_window12_384', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
-@register_model
-def swin_large_patch4_window7_224(pretrained=False, **kwargs) -> SwinTransformer:
-    """ Swin-L @ 224x224
-    """
-    model_args = dict(patch_size=4, window_size=7, embed_dim=192, depths=(2, 2, 18, 2), num_heads=(6, 12, 24, 48))
-    return _create_swin_transformer(
-        'swin_large_patch4_window7_224', pretrained=pretrained, **dict(model_args, **kwargs))
+# @register_model
+# def swin_large_patch4_window7_224(pretrained=False, **kwargs) -> SwinTransformer:
+#     """ Swin-L @ 224x224
+#     """
+#     model_args = dict(patch_size=4, window_size=7, embed_dim=192, depths=(2, 2, 18, 2), num_heads=(6, 12, 24, 48))
+#     return _create_swin_transformer(
+#         'swin_large_patch4_window7_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
-@register_model
-def swin_large_patch4_window12_384(pretrained=False, **kwargs) -> SwinTransformer:
-    """ Swin-L @ 384x384
-    """
-    model_args = dict(patch_size=4, window_size=12, embed_dim=192, depths=(2, 2, 18, 2), num_heads=(6, 12, 24, 48))
-    return _create_swin_transformer(
-        'swin_large_patch4_window12_384', pretrained=pretrained, **dict(model_args, **kwargs))
+# @register_model
+# def swin_large_patch4_window12_384(pretrained=False, **kwargs) -> SwinTransformer:
+#     """ Swin-L @ 384x384
+#     """
+#     model_args = dict(patch_size=4, window_size=12, embed_dim=192, depths=(2, 2, 18, 2), num_heads=(6, 12, 24, 48))
+#     return _create_swin_transformer(
+#         'swin_large_patch4_window12_384', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
-@register_model
-def swin_s3_tiny_224(pretrained=False, **kwargs) -> SwinTransformer:
-    """ Swin-S3-T @ 224x224, https://arxiv.org/abs/2111.14725
-    """
-    model_args = dict(
-        patch_size=4, window_size=(7, 7, 14, 7), embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24))
-    return _create_swin_transformer('swin_s3_tiny_224', pretrained=pretrained, **dict(model_args, **kwargs))
+# @register_model
+# def swin_s3_tiny_224(pretrained=False, **kwargs) -> SwinTransformer:
+#     """ Swin-S3-T @ 224x224, https://arxiv.org/abs/2111.14725
+#     """
+#     model_args = dict(
+#         patch_size=4, window_size=(7, 7, 14, 7), embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24))
+#     return _create_swin_transformer('swin_s3_tiny_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
-@register_model
-def swin_s3_small_224(pretrained=False, **kwargs) -> SwinTransformer:
-    """ Swin-S3-S @ 224x224, https://arxiv.org/abs/2111.14725
-    """
-    model_args = dict(
-        patch_size=4, window_size=(14, 14, 14, 7), embed_dim=96, depths=(2, 2, 18, 2), num_heads=(3, 6, 12, 24))
-    return _create_swin_transformer('swin_s3_small_224', pretrained=pretrained, **dict(model_args, **kwargs))
+# @register_model
+# def swin_s3_small_224(pretrained=False, **kwargs) -> SwinTransformer:
+#     """ Swin-S3-S @ 224x224, https://arxiv.org/abs/2111.14725
+#     """
+#     model_args = dict(
+#         patch_size=4, window_size=(14, 14, 14, 7), embed_dim=96, depths=(2, 2, 18, 2), num_heads=(3, 6, 12, 24))
+#     return _create_swin_transformer('swin_s3_small_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
-@register_model
-def swin_s3_base_224(pretrained=False, **kwargs) -> SwinTransformer:
-    """ Swin-S3-B @ 224x224, https://arxiv.org/abs/2111.14725
-    """
-    model_args = dict(
-        patch_size=4, window_size=(7, 7, 14, 7), embed_dim=96, depths=(2, 2, 30, 2), num_heads=(3, 6, 12, 24))
-    return _create_swin_transformer('swin_s3_base_224', pretrained=pretrained, **dict(model_args, **kwargs))
+# @register_model
+# def swin_s3_base_224(pretrained=False, **kwargs) -> SwinTransformer:
+#     """ Swin-S3-B @ 224x224, https://arxiv.org/abs/2111.14725
+#     """
+#     model_args = dict(
+#         patch_size=4, window_size=(7, 7, 14, 7), embed_dim=96, depths=(2, 2, 30, 2), num_heads=(3, 6, 12, 24))
+#     return _create_swin_transformer('swin_s3_base_224', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
-register_model_deprecations(__name__, {
-    'swin_base_patch4_window7_224_in22k': 'swin_base_patch4_window7_224.ms_in22k',
-    'swin_base_patch4_window12_384_in22k': 'swin_base_patch4_window12_384.ms_in22k',
-    'swin_large_patch4_window7_224_in22k': 'swin_large_patch4_window7_224.ms_in22k',
-    'swin_large_patch4_window12_384_in22k': 'swin_large_patch4_window12_384.ms_in22k',
-})
+# register_model_deprecations(__name__, {
+#     'swin_base_patch4_window7_224_in22k': 'swin_base_patch4_window7_224.ms_in22k',
+#     'swin_base_patch4_window12_384_in22k': 'swin_base_patch4_window12_384.ms_in22k',
+#     'swin_large_patch4_window7_224_in22k': 'swin_large_patch4_window7_224.ms_in22k',
+#     'swin_large_patch4_window12_384_in22k': 'swin_large_patch4_window12_384.ms_in22k',
+# })

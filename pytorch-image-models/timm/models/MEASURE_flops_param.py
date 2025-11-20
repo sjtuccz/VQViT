@@ -491,8 +491,8 @@ class vq_ffn_Block(nn.Module):
             return x, loss_dict, (feat0, feat)
 if __name__ == '__main__':
     from thop import profile, clever_format
-    from fvcore.nn import FlopCountAnalysis
-    from ptflops import get_model_complexity_info
+    # from fvcore.nn import FlopCountAnalysis
+    # from ptflops import get_model_complexity_info
 
     # vqmsa = VQMSA(dim=384,
     #         num_heads=6,
@@ -515,26 +515,27 @@ if __name__ == '__main__':
     # model=msa
     # model.reparameterize()
 
-    input_shape_3=(1,197,384)
+    # input_shape_3=(1,197,384)
 
 
 
 
-    model = nn.Linear(384,4)
-    # model.reparameterize()
+    model = nn.LayerNorm(384)
+    # model = nn.Linear(384,4)
+    # # model.reparameterize()
     model = model.cuda().eval()
     param_count = sum([m.numel() for m in model.parameters()])
-    param_count = format_param_count(param_count)
-    input=torch.randn(input_shape_3).cuda()
-    # output=model(input)
-    # if isinstance(output, tuple):
-    #     output = output[0]
+    # param_count = format_param_count(param_count)
+    input=torch.randn(384).cuda()
+    # # output=model(input)
+    # # if isinstance(output, tuple):
+    # #     output = output[0]
     flops, params = profile(model, inputs=(input,))
-    flops, params = clever_format([flops, params], "%.3f")
+    # flops, params = clever_format([flops, params], "%.3f")
     print(f"FLOPs: {flops} ,  params: {param_count}")
 
-    softmaxqkv = cal_qkvMatDot_FLOPs(batch=1,head_num = 6, seq_len = 50,dim = 384,block_num=12,isvq=True)
-    print(f"qkv FLOPs: {softmaxqkv} ")
+    # softmaxqkv = cal_qkvMatDot_FLOPs(batch=1,head_num = 6, seq_len = 145,dim = 384,block_num=12,isvq=False)
+    # print(f"qkv FLOPs: {softmaxqkv} ")
 
     # input = torch.randn(input_shape_3).cuda()  # 输入张量形状需匹配模型
     # flops = FlopCountAnalysis(model, input)

@@ -23,7 +23,7 @@ from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import DropPath, trunc_normal_
 from timm.models.registry import register_model
 from timm.layers.helpers import to_2tuple
-
+from timm.models.vectorquantize import choose_vq
 
 try:
     from mmseg.models.builder import BACKBONES as seg_BACKBONES
@@ -62,299 +62,6 @@ default_cfgs = {
 from einops import rearrange, repeat, reduce, pack, unpack
 import random
 import torch.nn.functional as F
-
-
-
-class FSQ_T(nn.Module):
-    def __init__(self, n_e, channels_in, channels_dim, index=0, levels=[15,15,15], T=1, flatten=False):
-        super().__init__()
-        print(f"Using FSQ_T,T= {T}")
-
-        self.compress = nn.Linear(channels_in, channels_dim)
-        self.expand = nn.Linear(channels_dim, channels_in)
-        assert len(levels) == channels_dim
-        self.codebook_dim = len(levels)
-        # self._levels = torch.tensor(levels, dtype=torch.int32)
-        self.register_buffer("_levels", torch.tensor(levels, dtype=torch.int32))
-        # self.codebook_size = self._levels.prod().item()
-        self.register_buffer("codebook_size", self._levels.prod())
-        self.register_buffer("T", torch.tensor(T, dtype=torch.int32))
-        basis = torch.cumprod(
-                torch.tensor([1] + levels[:-1], dtype=torch.int32), 
-                dim=0
-            )
-        self.register_buffer("_basis", basis)
-
-        self.is_pre_cal = False
-        self.flatten = flatten
-    def reparameterize(self):
-        print('using FSQ reparameterize')
-        self.is_pre_cal = True
-        print(f"codebook_size: {self.codebook_size}")
-        implicit_codebook = self._indices_to_codes(torch.arange(self.codebook_size))
-        print(f"implicit_codebook: {implicit_codebook.shape}")
-        # print('vq_dict: ', implicit_codebook)
-        # implicit_codebook = torch.tensor(implicit_codebook).to(self.expand.weight.device)
-        expand_dict = self.expand(implicit_codebook)
-        del self.expand
-        return expand_dict
-    
-    def forward(self, z):
-        '''
-        z: (b, h , channels_in)
-        '''
-        input = z
-        if self.flatten:
-            z = z.flatten(2).transpose(1, 2)
-
-        z = self.compress(z) # (b, h , dim)
-        # print(f"z shape: {z.shape}")
-        codes = self.quantize(z) # 输出范围(-T,T)
-        quantization_error = torch.mean((z-codes.detach())**2)
-        if random.random() < 0.0005:
-            
-            indices = self.codes_to_indices(codes)
-            unique_index=torch.unique(indices)
-            num_feature = z.shape[0] * z.shape[1]
-            print(f"ActivatedCode:{unique_index.shape[0]}, NumFeature: {num_feature}, CodebookSize: {self.codebook_size}, QuantiError: {quantization_error}")
-        
-        if not self.training and self.is_pre_cal:
-            indices = self.codes_to_indices(codes)
-            return indices
-        else:
-            z_q = self.expand(codes)
-            if self.flatten:
-                z_q = z_q.transpose(1, 2).view(input.shape)
-
-            # return z_q , quantization_error
-            return z_q , torch.tensor(0.0).cuda()
-    
-    def indices_to_level_indices(self, indices):
-        """ Converts indices to indices at each level, perhaps needed for a transformer with factorized embeddings """
-        indices = rearrange(indices, '... -> ... 1')
-        codes_non_centered = (indices // self._basis) % self._levels
-        return codes_non_centered
-
-    def _scale_and_shift_inverse(self, zhat):
-        half_width = self._levels // 2
-        return (zhat - half_width) / half_width *self.T
-
-    def _indices_to_codes(self, indices):
-        level_indices = self.indices_to_level_indices(indices)
-        codes = self._scale_and_shift_inverse(level_indices)
-        return codes
-    
-    def _scale_and_shift(self, zhat_normalized):
-        half_width = self._levels // 2
-        return (zhat_normalized / self.T * half_width) + half_width
-    
-    def codes_to_indices(self, zhat):
-        """ Converts a `code` to an index in the codebook. """
-        assert zhat.shape[-1] == self.codebook_dim
-        zhat = self._scale_and_shift(zhat)
-        return (zhat * self._basis).sum(dim=-1).to(torch.int32)
-
-    def round_ste(self, z: torch.Tensor) ->  torch.Tensor:
-        """Round with straight through gradients."""
-        zhat = z.round()
-        return z + (zhat - z).detach()
-        # return rotate_to(z, zhat) 
-
-    def bound(self, z, eps: float = 1e-3):
-        """ Bound `z`, an array of shape (..., d). """
-        half_l = ((self._levels - 1) * (1 + eps) / 2)
-        offset = torch.where(self._levels % 2 == 0, 0.5, 0.0).to(z.device)
-        shift = torch.atanh(offset / half_l)
-        z_bound = torch.tanh(z/self.T + shift) * half_l - offset
-        return z_bound
-    
-    def quantize(self, z):
-        """ Quantizes z, returns quantized zhat, same shape as z. """
-        quantized = self.round_ste(self.bound(z)).to(z.device)
-        half_width = (self._levels // 2).to(z.device)# Renormalize to [-T, T].
-        return quantized / half_width * self.T
-
-class FSQ_trainableT(nn.Module):
-    '''
-    Based on vanilla FSQ, the backpropagation of quantization_error 
-    and the dynamic trainable quantization range have been added.
-    '''
-    def __init__(self, n_e, channels_in, channels_dim, index=0, levels=[15,15,15], T=0, T_min=0.1, flatten=False):
-        super().__init__()
-        print(f"Using FSQ_trainableT, T init= {T}")
-
-        self.compress = nn.Linear(channels_in, channels_dim)
-        self.expand = nn.Linear(channels_dim, channels_in)
-        # self.compress = nn.Linear(channels_in, channels_dim, bias=False)
-        # self.expand = nn.Linear(channels_dim, channels_in, bias=False)
-        assert len(levels) == channels_dim
-        self.codebook_dim = len(levels)
-        self.register_buffer("_levels", torch.tensor(levels, dtype=torch.int32))
-        self.register_buffer("codebook_size", torch.tensor(self._levels.prod(), dtype=torch.int32))
-        self.register_buffer("T_min", torch.tensor(T_min, dtype=torch.float))
-        self.T_raw = nn.Parameter(torch.tensor([T for _ in range(self.codebook_dim)], dtype=torch.float32))
-
-        basis = torch.cumprod(
-                torch.tensor([1] + levels[:-1], dtype=torch.int32), 
-                dim=0
-            )
-        self.register_buffer("_basis", basis)
-
-        self.is_pre_cal = False
-        self.flatten = flatten
-    def get_T(self):
-        T_softplus =  F.softplus(self.T_raw) 
-        return T_softplus
-    
-    def reparameterize(self):
-        print('using FSQ_trainableT reparameterize')
-        self.is_pre_cal = True
-        implicit_codebook = self._indices_to_codes(torch.arange(self.codebook_size))
-        expand_dict = self.expand(implicit_codebook)
-        del self.expand
-        self.register_buffer("T_softplus", self.get_T())
-        del self.T_raw
-        return expand_dict
-    
-    def forward(self, z):
-        '''
-        z: (b, h , channels_in)
-        '''
-        rand = random.random()
-        input = z
-        if self.flatten:
-            z = z.flatten(2).transpose(1, 2)
-        z = self.compress(z) # (b, h , dim)
-        codes = self.quantize(z) # range (-T,T)
-        quantization_error = torch.mean((z-codes.detach())**2)
-        if rand < 0.0005:
-            # analyze_tensor(input, name="input")
-            # analyze_tensor(z, name="compress")
-            # analyze_tensor(codes, name="codes")
-            indices = self.codes_to_indices(codes)
-            unique_index=torch.unique(indices)
-            num_feature = z.shape[0] * z.shape[1]
-            # print(f"NumFeature: {num_feature}, CodebookSize: {self.codebook_size}, QuantiError: {quantization_error}")
-            print(f"ActivatedCode:{unique_index.shape[0]}, NumFeature: {num_feature}, CodebookSize: {self.codebook_size}, QuantiError: {quantization_error}")
-        
-        if not self.training and self.is_pre_cal:
-            indices = self.codes_to_indices(codes)
-            return indices
-        else:
-            z_q = self.expand(codes)
-            if self.flatten:
-                z_q = z_q.transpose(1, 2).view(input.shape)
-            # return z_q , quantization_error
-            return z_q , torch.tensor(0.0).cuda()
-    
-    def indices_to_level_indices(self, indices):
-        """ Converts indices to indices at each level, perhaps needed for a transformer with factorized embeddings """
-        indices = rearrange(indices, '... -> ... 1')
-        codes_non_centered = (indices // self._basis) % self._levels
-        return codes_non_centered
-
-    def _scale_and_shift_inverse(self, zhat):
-        half_width = self._levels // 2
-        if not self.training and self.is_pre_cal:
-            return (zhat - half_width) / half_width *self.T_softplus
-        else:
-            return (zhat - half_width) / half_width *self.get_T()
-
-    def _indices_to_codes(self, indices):
-        level_indices = self.indices_to_level_indices(indices)
-        codes = self._scale_and_shift_inverse(level_indices)
-        return codes
-    
-    def _scale_and_shift(self, zhat_normalized):
-        half_width = self._levels // 2
-        if not self.training and self.is_pre_cal:
-            return (zhat_normalized / self.T_softplus * half_width) + half_width
-        return (zhat_normalized / self.get_T() * half_width) + half_width
-    
-    def codes_to_indices(self, zhat):
-        """ Converts a `code` to an index in the codebook. """
-        assert zhat.shape[-1] == self.codebook_dim
-        zhat = self._scale_and_shift(zhat)
-        return (zhat * self._basis).sum(dim=-1).to(torch.int32)
-
-    def round_ste(self, z: torch.Tensor) ->  torch.Tensor:
-        """Round with straight through gradients."""
-        zhat = z.round()
-        return z + (zhat - z).detach()
-        # return zhat
-        # return rotate_to(z, zhat) 
-
-    def bound(self, z, eps: float = 1e-3):
-        """ Bound `z`, an array of shape (..., d). """
-        half_l = ((self._levels - 1) * (1 + eps) / 2)
-        offset = torch.where(self._levels % 2 == 0, 0.5, 0.0).to(z.device)
-        shift = torch.atanh(offset / half_l)
-        if not self.training and self.is_pre_cal:
-            z_bound = torch.tanh(z/self.T_softplus + shift) * half_l - offset
-        else:
-            z_bound = torch.tanh(z/self.get_T() + shift) * half_l - offset
-        return z_bound
-    
-    def quantize(self, z):
-        # print("z shape :",z.shape)
-        """ Quantizes z, returns quantized zhat, same shape as z. """
-        quantized = self.round_ste(self.bound(z)).to(z.device)
-        half_width = (self._levels // 2).to(z.device)# Renormalize to [-T, T].
-        if not self.training and self.is_pre_cal:
-            return quantized / half_width * self.T_softplus
-        return quantized / half_width * self.get_T()
-        
-class VectorQuantizer(nn.Module):
-    def __init__(self, n_e, channels_in, channels_dim, index=0, flatten=False):
-        super().__init__()
-        self.embedding = nn.Embedding(n_e, channels_dim)
-        trunc_normal_(self.embedding.weight, mean=0.0, std=1.0, a=-3.0, b=3.0)
-        self.compress = nn.Linear(channels_in, channels_dim)
-        self.expand = nn.Linear(channels_dim, channels_in)
-        self.codebook_size = n_e
-        self.codebook_dim = channels_dim
-        self.is_pre_cal = False
-        self.flatten = flatten
-    def reparameterize(self):
-        print('using VQ reparameterize')
-        self.is_pre_cal = True
-        dict_embeding = self.embedding.weight.data.clone().detach()
-        expand_dict = self.expand(dict_embeding)
-        del self.expand
-        return expand_dict
-    def forward(self, z):
-        input = z
-        if self.flatten:
-            z = z.flatten(2).transpose(1, 2) 
-        z = self.compress(z)
-        z_flattened = z.view(-1, z.shape[-1]) # bhw,c
-        num_feature = z_flattened.shape[0]
-        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
-            torch.sum(self.embedding.weight ** 2, dim=1) - 2 * \
-            torch.einsum('bd,dn->bn', z_flattened, rearrange(self.embedding.weight, 'n d -> d n'))
-        indices = torch.argmin(d, dim=1)
-        if not self.training and self.is_pre_cal:
-            return indices
-        unique_index=torch.unique(indices)
-        z_q = self.embedding(indices)
-        if self.training:
-            loss_dict = torch.mean((z_q.detach()-z_flattened)**2) + 2.0* torch.mean((z_q - z_flattened.detach()) ** 2)
-            z_q = z_q.detach()+ (z_flattened - z_flattened.detach())
-            z_q = z_q.view(z.shape)
-            z_q = self.expand(z_q)
-            if random.random() < 0.0008:
-                print(f"activated vectors:{unique_index.shape[0]} , num feature: {num_feature}, num dict: {self.codebook_size}")
-            if self.flatten:
-                z_q = z_q.transpose(1, 2).view(input.shape)
-            return z_q, loss_dict 
-        else:
-            z_q = z_q.view(z.shape)
-            z_q = self.expand(z_q)
-            if random.random() < 0.001:
-                print(f"activated vectors:{unique_index.shape[0]} , num feature: {num_feature}, num dict: {self.codebook_size}")
-            if self.flatten:
-                z_q = z_q.transpose(1, 2).view(input.shape)
-            return z_q , torch.tensor(0.0).cuda()
 
 class PatchEmbed(nn.Module):
     """
@@ -527,8 +234,8 @@ class vq_PoolFormerBlock(nn.Module):
                  drop=0., drop_path=0., 
                  use_layer_scale=True, layer_scale_init_value=1e-5, 
                  
-                 vq_type='tfsq',fsq_level = [3,3,3,3],
-                dic_n=None, dic_dim=4, index=0, fsq_Tinit=-1):
+                vq_type='fsq_qd',fsq_level = [3,3,3,3],
+                dic_n=None, dic_dim=4, fsq_Tinit=1):
 
         super().__init__()
 
@@ -548,43 +255,39 @@ class vq_PoolFormerBlock(nn.Module):
                 layer_scale_init_value * torch.ones((dim)), requires_grad=True)
             self.layer_scale_2 = nn.Parameter(
                 layer_scale_init_value * torch.ones((dim)), requires_grad=True)
-        if vq_type == 'vq':
-            self.vq = VectorQuantizer(dic_n, dim, dic_dim, 0, flatten=True)
-        elif vq_type == 'tfsq':
-            self.vq = FSQ_trainableT(dic_n, dim, dic_dim, 0, levels=fsq_level, T=fsq_Tinit, flatten=True)
-        elif vq_type == 'fsq':
-            self.vq = FSQ_T(dic_n, dim, dic_dim, 0, levels=fsq_level, T=1, flatten=True)
-        self.is_pre_cal = False
+        self.vq = choose_vq(vq_type=vq_type, dic_n=dic_n, dim=dim, dic_dim=dic_dim, fsq_level=fsq_level, fsq_Tinit=fsq_Tinit, input_format='NCHW')
+        self.token_wise_rep = False
         self.dim = dim
     def reparameterize(self):
         ''' 
-        reparameterize the vq dict and calculate the pre_cal_dict for inference, 
+        reparameterize the vq dict and calculate the rep_codebook for inference, 
         the case where the codebook is not a square matrix has also been taken into consideration. 
         '''
         print('using Block reparameterize')
-        self.is_pre_cal = True
-        self.pre_cal_dict = nn.Embedding(self.vq.codebook_size, self.dim)
+        self.token_wise_rep = True
+        self.rep_codebook = nn.Embedding(self.vq.codebook_size, self.dim)
         # print(self.dim)
-        vq_dict = self.vq.reparameterize() # (codebook size, dim)
-        N, D = vq_dict.shape[0], vq_dict.shape[1]
-        vq_dict_transposed = vq_dict.transpose(0, 1) # N, D -> D, N
+        fixed_codebook = self.vq.reparameterize() # (codebook size, dim)
+        N, D = fixed_codebook.shape[0], fixed_codebook.shape[1]
+        fixed_codebook_transposed = fixed_codebook.transpose(0, 1).contiguous() # N, D -> D, N
+        # handle the case where N is not a perfect square number for Conv
         h = int(torch.sqrt(torch.tensor(N)).ceil().item())
         w = (N + h - 1) // h
         if h * w > N:
             pad_size = h * w - N
-            x_padded = torch.cat([vq_dict_transposed, torch.zeros(D, pad_size, device=vq_dict_transposed.device)], dim=1)
+            x_padded = torch.cat([fixed_codebook_transposed, torch.zeros(D, pad_size, device=fixed_codebook_transposed.device)], dim=1)
         else:
-            x_padded = vq_dict_transposed
-        vq_dict_rep = x_padded.reshape(1, D,h,w) # (1, D, h, w)
-        x = self.mlp(vq_dict_rep)
+            x_padded = fixed_codebook_transposed
+        fixed_codebook_rep = x_padded.reshape(1, D,h,w) # (1, D, h, w)
+        x = self.mlp(fixed_codebook_rep)
         if self.use_layer_scale:
             x = self.layer_scale_2.unsqueeze(-1).unsqueeze(-1)* x
             del self.layer_scale_2
         x = x.reshape(D, -1) # (D, h*w)
         if h * w > N:
             x = x[:, :N] # (D, N)
-        x = x.transpose(0, 1) # (N, D)
-        self.pre_cal_dict.weight.data.copy_(x)
+        x = x.transpose(0, 1).contiguous() # (N, D)
+        self.rep_codebook.weight.data.copy_(x)
         del self.mlp
 
     def forward(self, x):
@@ -595,10 +298,10 @@ class vq_PoolFormerBlock(nn.Module):
             feat1 = x # for distillation
             x = self.norm2(x)
             loss_dict=torch.tensor(0.0).cuda()
-            if not self.training and self.is_pre_cal:
+            if not self.training and self.token_wise_rep:
                 embedding_index =  self.vq(x)
-                z_q = self.pre_cal_dict(embedding_index)
-                x = z_q.transpose(1, 2).reshape(feat1.shape)
+                z_q = self.rep_codebook(embedding_index)
+                x = z_q.transpose(1, 2).reshape(feat1.shape).contiguous()
                 return x+feat1, loss_dict
             x , loss_dict= self.vq(x)
             x = self.mlp(x)
@@ -612,9 +315,9 @@ class vq_PoolFormerBlock(nn.Module):
             feat1 = x # for distillation
             x = self.norm2(x)
             loss_dict=torch.tensor(0.0).cuda()
-            if not self.training and self.is_pre_cal:
+            if not self.training and self.token_wise_rep:
                 embedding_index =  self.vq(x)
-                z_q = self.pre_cal_dict(embedding_index)
+                z_q = self.rep_codebook(embedding_index)
                 x = z_q.transpose(1, 2).reshape(feat1.shape)
                 return x+feat1, loss_dict
             x , loss_dict= self.vq(x)
@@ -642,8 +345,8 @@ def basic_blocks(dim, index, layers,
                  drop_rate=.0, drop_path_rate=0., 
                  use_layer_scale=True, layer_scale_init_value=1e-5,
                  
-                 vq_type='tfsq',fsq_level = [3,3,3,3],
-                dic_n=None, dic_dim=4, fsq_Tinit=-1):
+                 vq_type='fsq_qd',fsq_level = [3,3,3,3],
+                dic_n=None, dic_dim=4, fsq_Tinit=1):
     """
     generate PoolFormer blocks for a stage
     return: PoolFormer blocks 
@@ -707,12 +410,12 @@ class vqPoolFormer(nn.Module):
                  init_cfg=None, 
                  pretrained=None, 
 
-                 vq_type='tfsq',fsq_level = [3,3,3,3],
-                dic_n=None, dic_dim=4, fsq_Tinit=-1,
+                 vq_type='fsq_qd',fsq_level = [3,3,3,3],
+                dic_n=None, dic_dim=4, fsq_Tinit=1,
                  **kwargs):
 
         super().__init__()
-        self.is_pre_cal = False
+        self.token_wise_rep = False
         if not fork_feat:
             self.num_classes = num_classes
         self.fork_feat = fork_feat
@@ -822,7 +525,7 @@ class vqPoolFormer(nn.Module):
             # print('missing_keys: ', missing_keys)
             # print('unexpected_keys: ', unexpected_keys)
     def reparameterize(self):
-        self.is_pre_cal = True
+        self.token_wise_rep = True
         for module in self.network:  # 遍历ModuleList中的每个模块
             print(f"Found module: {module.__class__.__name__.lower()}, {isinstance(module, nn.Sequential)}")
             if isinstance(module, nn.Sequential):
@@ -878,7 +581,28 @@ class vqPoolFormer(nn.Module):
         if quantize_loss_list:
             return cls_out, torch.stack(quantize_loss_list).mean()
         return cls_out
-
+    @torch.jit.ignore
+    def print_codebook_utilization(self):
+        sum_util = 0.0
+        average_util = 0.0
+        count = 0
+        found_modules = []  # 用于记录找到的模块及其路径
+        # 递归遍历所有子模块
+        for module_name, module in self.named_modules():
+            # 检查模块是否是 VQ 实例（根据您的类名调整条件）
+            # 例如，如果您的VQ类名为 VectorQuantizer：
+            if hasattr(module, 'codebook_meter'): # 或者使用 isinstance(module, VectorQuantizer)
+                utilization = module.codebook_meter.utilization # 注意：这里是属性，不是方法调用
+                print(f'VQ Module [{module_name}] Codebook Utilization: {utilization * 100:.2f}%')
+                found_modules.append(module_name)
+                sum_util += utilization
+                count += 1
+        if count > 0:
+            average_util = sum_util / count
+            print(f'Average VQ Codebook Utilization (across {count} modules): {average_util*100:.2f}%')
+        else:
+            print('No VQ modules with codebook meters found.')
+        return average_util
 
 model_urls = {
     "poolformer_s12": "https://github.com/sail-sg/poolformer/releases/download/v1.0/poolformer_s12.pth.tar",

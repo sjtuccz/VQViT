@@ -1428,7 +1428,7 @@ def vqvit_small_patch32_384(pretrained=False, **kwargs) -> vqVisionTransformer:
     VQViT is adapted from
     ViT-Small (ViT-S/32) at 384x384.
     """
-    model_args = dict(patch_size=32, embed_dim=384, depth=12, num_heads=6)
+    model_args = dict(patch_size=32, embed_dim=384, depth=12, num_heads=6, img_size=384)
     model = _create_vision_transformer('vqvit_small_patch32_384', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 

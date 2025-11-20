@@ -264,7 +264,8 @@ def param_group_fn_with_weight_decay_vq(
         filter_bias_and_bn,
         weight_decay: float = 1e-5,
         no_weight_decay_list=(),
-        lr_decay: float = 0.01
+        lr_decay: float = 0.1,
+        wd_decay: float = 0.1
 ):
     """
     for vq
@@ -290,7 +291,7 @@ def param_group_fn_with_weight_decay_vq(
 
             # 设置学习率
             lr = base_lr * lr_decay if 'vq' not in name else base_lr
-
+            fix_weight_decay = weight_decay if 'vq' not in name else weight_decay * wd_decay
             # 设置是否使用权重衰减
             if param.ndim <= 1 or name.endswith(".bias") or name in no_weight_decay_list or 'embedding' in name: 
                 no_decay.append({
@@ -302,7 +303,7 @@ def param_group_fn_with_weight_decay_vq(
                 decay.append({
                     'params': param,
                     'lr': lr,
-                    'weight_decay': weight_decay  # 应用指定的权重衰减
+                    'weight_decay': fix_weight_decay  # 应用指定的权重衰减
                 })
         # 返回包含权重衰减和学习率的两个分组
         return no_decay + decay

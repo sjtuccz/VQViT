@@ -177,8 +177,8 @@ class FeatureLossCosine(nn.Module):
             if isinstance(fs, (list, tuple)) or isinstance(ft, (list, tuple)):
                 # print('using cosine similarity loss for feature 2,4 distillation')
                 for s, t in zip(fs, ft):
-                    # print(s.shape)
-                    # print(t.shape)
+                    print(s.shape)
+                    print(t.shape)
                     assert s.size() == t.size(), 'sizes of teacher and student outputs must be the same'
                     loss_all += (1 - F.cosine_similarity(s, t, dim=-1)).mean()
             else:

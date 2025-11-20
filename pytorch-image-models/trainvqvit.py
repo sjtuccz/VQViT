@@ -7,10 +7,8 @@ CUDA_VISIBLE_DEVICES=1 python trainvq.py -j 16
 --vqtype tfsq 
 --dict-dim 4
 --fsq-level 3 3 3 3
---FLfn cos 
 --Disfn DKD 
 --klloss-weight 4.0 
---featureloss-weight 0.0 
 --model vqvit_tiny_patch16_224 
 --teacher-model vit_tiny_patch16_224 
 --output  
@@ -26,8 +24,6 @@ CUDA_VISIBLE_DEVICES=1 python trainvq.py -j 16
 --drop 0.0 
 --amp 
 --cooldown-epochs 10 
---featureloss-reduction sum 
---dictloss-weight 1.0 
 --clip-grad 600.0 
 --T 1.0 
 --scale 0.5 1.0  
@@ -125,26 +121,22 @@ group.add_argument('--dataset-download', action='store_true', default=False,
 group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
                    help='path to class to idx mapping file (default: "")')
 
+
+group.add_argument('--pretrained-finetune', action='store_true', default=False,
+                   help='use different lr for pretrained layers and head (default: False)')
+
+
+
 # Model parameters
 group = parser.add_argument_group('Model parameters')
 group.add_argument('--model', default='vit_small_patch32_224', type=str, metavar='MODEL',
                    help='Name of model to train (default: "resnet50")')
 
-group.add_argument('--vqtype', default='tfsq', type=str, metavar='VQ',
-                   help='vqtype: vq or fsq')
+group.add_argument('--vqtype', default='fsq_qd', type=str, metavar='VQ',
+                   help='vqtype')
 group.add_argument('--fsq-level', type=int, nargs='+', default=[3,3,3,3], metavar='FSQLEVEL',
                    help='fsq level')
 
-group.add_argument('--kmeans-init-code', action='store_true', default=False,
-                   help='vit feature kmeans init codebook. (default: False)')
-group.add_argument('--init-fsqt', action='store_true', default=False,
-                   help='vit feature init T of fsq if using fsq. (default: False)')
-group.add_argument('--freeze-wo-vq', action='store_true', default=False,
-                   help=' freeze all except vq block. (default: False)')
-group.add_argument('--shared-codebook', action='store_true', default=False,
-                   help=' share the codebook across all VQBlock. (default: False)')
-parser.add_argument('--dict-num', default=256, type=int, metavar='vqvit_dict',
-                    help='vqvit dict size')
 parser.add_argument('--dict-dim', default=2, type=int, metavar='vqvit_dict_dim',
                     help='vqvit dict dim')
 parser.add_argument('--teacher-model', default=None, type=str, metavar='TEACHER-MODEL',
@@ -153,8 +145,7 @@ group.add_argument('--pretrained', action='store_true', default=False,
                    help='Start with pretrained version of specified network (if avail)')
 group.add_argument('--teacher-pretrained', action='store_true', default=False,
                    help='Start with pretrained version of specified teacher network (if avail)')
-group.add_argument('--pretrained-finetune', action='store_true', default=False,
-                   help='use different lr for pretrained layers and head (default: False)')
+
 group.add_argument('--initial-checkpoint', default=None, type=str, metavar='PATH',
                    help='Initialize model from this checkpoint (default: none)')
 parser.add_argument('--teacher-checkpoint', default=None, type=str, metavar='PATH',
@@ -234,16 +225,10 @@ parser.add_argument('--T', type=float, default=1.0,
                     help='knowledge distillation loss temperature')
 parser.add_argument('--top-k', type=int, default=None,
                     help='top k for distillation cos sim loss')
-parser.add_argument('--dictloss-weight', type=float, default=1.0, help='dic loss weight')
 parser.add_argument('--celoss-weight', type=float, default=1.0, help='loss weight')
 parser.add_argument('--klloss-weight', type=float, default=4.0, help='kl loss weight')
-parser.add_argument('--FLfn', default='cos', type=str, metavar='FLossFunc',
-                    help='type of feature loss func (default: L2) One of ("L2", "KL", "")')
 parser.add_argument('--Disfn', default='DKD', type=str, metavar='DIStillLossFunc',
                     help='type of distillation loss func (default: KlDiv) One of ("CE", "KL", "")')
-parser.add_argument('--featureloss-weight', type=float, default=2.0, help='feature loss weight')
-parser.add_argument('--featureloss-reduction', default='mean', type=str, metavar='POOL',
-                    help='sum or mean reduction for feature loss (default: sum)')
 
 # Learning rate schedule parameters
 group = parser.add_argument_group('Learning rate schedule parameters')
@@ -253,7 +238,7 @@ group.add_argument('--sched-on-updates', action='store_true', default=False,
                    help='Apply LR scheduler step on update instead of epoch end.')
 group.add_argument('--lr', type=float, default=4e-4, metavar='LR',
                    help='learning rate, overrides lr-base if set (default: None)')
-group.add_argument('--lr-decay', type=float, default=0.1, metavar='LR',
+group.add_argument('--lr-decay', type=float, default=0.01, metavar='LR',
                    help='lr-decay for pretrained finetune, other layer (default: other_layer_lr/head_lr=0.01')
 group.add_argument('--lr-base', type=float, default=0.1, metavar='LR',
                    help='base learning rate: lr = lr_base * global_batch_size / base_size')
@@ -449,79 +434,7 @@ def _parse_args():
 
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
-    return args, args_text
-
-from kmeans_init_codebook import kmeans_pca_fit_dim
-def init_codebook(model, feat_list):
-    '''使用kmeans聚类token进行codebook的初始化，如果token和codebook的维度不同，则使用PCA降维'''
-    print('===============================================================init codebook using kmeans vit features')
-    if isinstance(feat_list[0], (list,tuple)):
-        for block, feat in zip(model.blocks, feat_list):
-            # for vq qkv , vq proj
-            device = block.vq.embedding.weight.device
-            qkv_feat = feat[0]
-            proj_feat = feat[1]
-            qkv_centroids, counts = kmeans_pca_fit_dim(qkv_feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
-            block.vq.embedding.weight.data = qkv_centroids.to(device)
-
-            # proj_centroids, counts = kmeans_pca_fit_dim(proj_feat, block.attn.vq.embedding.weight.data.shape[0], block.attn.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
-            # block.attn.vq.embedding.weight.data = proj_centroids.to(device)
-
-            # # for vq qkv , vq ffn
-            # device = block.vq.embedding.weight.device
-            # attn_feat = feat[0]
-            # ffn_feat = feat[1]
-            # ffn_centroids, counts = kmeans_pca_fit_dim(ffn_feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
-            # block.vq.embedding.weight.data = ffn_centroids.to(device)
-
-            # attn_centroids, counts = kmeans_pca_fit_dim(attn_feat, block.attnvq.embedding.weight.data.shape[0], block.attnvq.embedding.weight.data.shape[1],use_cosine_sim=True)
-            # block.attnvq.embedding.weight.data = attn_centroids.to(device)
-    else:
-        for block, feat in zip(model.blocks, feat_list):
-            
-            # device = block.vq.embedding.weight.device
-            # centroids, counts = kmeans_pca_fit_dim(feat, block.vq.embedding.weight.data.shape[0], block.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
-            # block.vq.embedding.weight.data = centroids.to(device)
-
-            device = block.attn.vq.embedding.weight.device
-            attn_centroids, counts = kmeans_pca_fit_dim(feat, block.attn.vq.embedding.weight.data.shape[0], block.attn.vq.embedding.weight.data.shape[1],use_cosine_sim=True)
-            block.attn.vq.embedding.weight.data = attn_centroids.to(device)
-
-def init_fsqt(model, feat_list):
-    
-    print('===============================================================init T of fsq using vit features')
-    step = 0.1
-    t_range = (torch.arange(1, 101) * step).round(decimals=1).to(feat_list[0].device)  # 1→0.1, 2→0.2,..., 50→5.0
-    for block, feat in zip(model.blocks, feat_list):
-        fsq = block.vq
-        codebook_dim = block.vq.codebook_dim
-        # max_value = feat.max()
-        # min_value = feat.min()
-        # mean = feat.mean()
-        # std = feat.std()
-        # input = mean + std * torch.randn(1, 100000, codebook_dim, device=feat.device)
-        # input = torch.clamp(input, min=-min_value, max=max_value)
-        # print(f'mean: {mean}, std: {std}, max_value: {max_value}, min_value: {min_value}')
-
-        samples = rearrange(feat, 'b h d ->(b h) d') 
-        x_np = samples.cpu().numpy()
-        pca = PCA(n_components=codebook_dim)
-        x_reduced = pca.fit_transform(x_np)
-        input = torch.from_numpy(x_reduced)
-        input = rearrange(input, '(b h) d -> b h d', b=feat.shape[0], h=feat.shape[1]).to(feat.device)
-
-        error_recoed = []
-        for i, t in enumerate(t_range):
-            fsq.T = t
-            output1 = fsq.quantize(input)
-            error = torch.abs(output1 - input).sum()
-            error_recoed.append(error)
-            # print(f'i: {i}, error: {error}, t: {t}')
-        t_optimal = t_range[error_recoed.index(min(error_recoed))]
-        fsq.T = t_optimal
-        print(f't_optimal: {t_optimal}')
-
-        
+    return args, args_text 
 
 def main():
     utils.setup_default_logging()
@@ -616,28 +529,15 @@ def main():
         checkpoint_path=args.initial_checkpoint if not args.pretrained else None,
         # strict=True,
         strict=False,
-        dic_n=args.dict_num, dic_dim=args.dict_dim,
+        dic_dim=args.dict_dim,
         vq_type=args.vqtype,
         fsq_level=args.fsq_level,
         **args.model_kwargs,
     )
-    if args.shared_codebook:
-        model.use_shared_codebook()
-
-    def freeze_but_keep_VQ_grad(model):
-        print("freeze VQ Block")
-        for name, param in model.named_parameters():
-            if 'vq' in name or 'head' in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False 
-    if args.freeze_wo_vq:
-        print('freezing all except vq')
-        freeze_but_keep_VQ_grad(model)
 
     init_teacher_checkpoint = (args.teacher_checkpoint or args.initial_checkpoint) if not args.teacher_pretrained else None
     teacher_model = None
-    if (args.klloss_weight or args.featureloss_weight) and args.teacher_model:
+    if args.klloss_weight and args.teacher_model:
         teacher_model = create_teacher_model(
             model_name = args.teacher_model,
             num_classes=args.num_classes,
@@ -726,6 +626,7 @@ def main():
             _logger.info(
                 f'Learning rate ({args.lr}) calculated from base learning rate ({args.lr_base}) '
                 f'and effective global batch size ({global_batch_size}) with {args.lr_base_scale} scaling.')
+    
     if args.pretrained_finetune:
         print('using pretrained finetune, In addition to the head layer, the rest of the layers loaded with pre-training weights use a smaller learning rate, If lr_decay==0, freeze the pre-training layer')
         optimizer = create_optimizer_v2(
@@ -858,6 +759,7 @@ def main():
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
+    print('mean: ', data_config['mean'])
     loader_train = create_loader(
         dataset_train,
         input_size=data_config['input_size'],
@@ -888,39 +790,7 @@ def main():
         use_multi_epochs_loader=args.use_multi_epochs_loader,
         worker_seeding=args.worker_seeding,
     )
-    loader_init = None
-    if args.kmeans_init_code or args.init_fsqt:
-        loader_init = create_loader(
-            dataset_train,
-            input_size=data_config['input_size'],
-            batch_size=6000,
-            is_training=True,
-            use_prefetcher=args.prefetcher,
-            no_aug=args.no_aug,
-            re_prob=args.reprob,
-            re_mode=args.remode,
-            re_count=args.recount,
-            re_split=args.resplit,
-            scale=args.scale,
-            ratio=args.ratio,
-            hflip=args.hflip,
-            vflip=args.vflip,
-            color_jitter=args.color_jitter,
-            auto_augment=args.aa,
-            num_aug_repeats=args.aug_repeats,
-            num_aug_splits=num_aug_splits,
-            interpolation=train_interpolation,
-            mean=data_config['mean'],
-            std=data_config['std'],
-            num_workers=1,
-            distributed=args.distributed,
-            collate_fn=collate_fn,
-            pin_memory=False,
-            device=device,
-            use_multi_epochs_loader=False,
-            worker_seeding=args.worker_seeding,
-        )
-
+    
     eval_workers = args.workers
     if args.distributed and ('tfds' in args.dataset or 'wds' in args.dataset):
         # FIXME reduces validation padding issues when using TFDS, WDS w/ workers and distributed training
@@ -973,17 +843,6 @@ def main():
         kl_criterion = DKD(args.T, alpha=0.5, beta=1.5).to(device=device)
     else:   
         kl_criterion =  DistillKL(args.T).to(device=device)
-
-    if args.featureloss_weight ==0:
-        feature_criterion =  None
-    elif args.FLfn=='KL':
-        feature_criterion =  FeatureLossKL(reduction=args.featureloss_reduction).to(device=device)
-    elif args.FLfn=='cos':
-        feature_criterion =  FeatureLossCosine(reduction=args.featureloss_reduction).to(device=device)
-    elif args.FLfn=='klcos':
-        feature_criterion =  FeatureLossCosineKL(reduction=args.featureloss_reduction).to(device=device)
-    else:
-        feature_criterion =  FeatureLossL2(reduction=args.featureloss_reduction).to(device=device)
         
 
     # setup checkpoint saver and eval metric tracking
@@ -1072,7 +931,7 @@ def main():
                 loader_train,
                 optimizer,
                 train_loss_fn,
-                kl_criterion, feature_criterion,
+                kl_criterion,
                 args,
                 lr_scheduler=lr_scheduler,
                 saver=saver,
@@ -1081,14 +940,7 @@ def main():
                 loss_scaler=loss_scaler,
                 model_ema=model_ema,
                 mixup_fn=mixup_fn,
-                loader_init=loader_init if loader_init else None
             )
-            if loader_init:
-                # onlu use once
-                if hasattr(loader_init, '_workers'):
-                    loader_init._shutdown_workers() 
-                del loader_init
-            loader_init=None
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if utils.is_primary(args):
@@ -1153,7 +1005,7 @@ def train_one_epoch(
         loader,
         optimizer,
         loss_fn,
-        kl_criterion, feature_criterion,
+        kl_criterion,
         args,
         device=torch.device('cuda'),
         lr_scheduler=None,
@@ -1163,7 +1015,6 @@ def train_one_epoch(
         loss_scaler=None,
         model_ema=None,
         mixup_fn=None,
-        loader_init=None
 ):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
@@ -1176,9 +1027,7 @@ def train_one_epoch(
     update_time_m = utils.AverageMeter()
     data_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
-    losses_dict_m= utils.AverageMeter()
     losses_kl_m = utils.AverageMeter()
-    losses_feature_m = utils.AverageMeter()
 
     model.train()
     if teacher_model:
@@ -1194,17 +1043,6 @@ def train_one_epoch(
     data_start_time = update_start_time = time.time()
     optimizer.zero_grad()
     update_sample_count = 0
-
-    if loader_init and not args.resume:
-        for batch_idx, (input, target) in enumerate(loader_init):
-            if teacher_model:
-                with torch.no_grad():
-                    teacher_output, init_feat_list = teacher_model(input,init_codebook_feat=True)
-            if args.vqtype == 'vq' and args.kmeans_init_code:
-                init_codebook(model,init_feat_list)
-            elif args.vqtype == 'fsq' and args.init_fsqt:
-                init_fsqt(model,init_feat_list)
-            break
 
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_batch_idx
@@ -1226,28 +1064,20 @@ def train_one_epoch(
             with amp_autocast():
                 if teacher_model:
                     with torch.no_grad():
-                        teacher_output = teacher_model(input,is_feat=(args.featureloss_weight>0))
+                        teacher_output = teacher_model(input)
                         if isinstance(teacher_output, tuple):
-                            teacher_feat = teacher_output[1]
                             teacher_output = teacher_output[0]
-                output = model(input,is_feat=(args.featureloss_weight>0))
+                output = model(input)
                 if isinstance(output, tuple):
-                    dict_loss = output[1]
-                    feat = output[2] if args.featureloss_weight>0 else None
                     output = output[0]
                 loss = loss_fn(output, target) * args.celoss_weight
-                loss_dict = dict_loss * args.dictloss_weight
                 if not kl_criterion:
                     loss_kl = torch.tensor(0.0).to(device)
                 elif isinstance(kl_criterion, DKD):
                     loss_kl =  kl_criterion(output, teacher_output.detach(), target) * args.klloss_weight
                 else:
                     loss_kl =  kl_criterion(output, teacher_output.detach()) * args.klloss_weight
-                if not feature_criterion:
-                    loss_feature = torch.tensor(0.0).to(device)
-                else:
-                    loss_feature = feature_criterion(feat,teacher_feat) *args.featureloss_weight
-                sum_loss = [loss , loss_dict ,loss_kl, loss_feature]
+                sum_loss = [loss ,loss_kl]
             return sum_loss
 
         def _backward(_loss):
@@ -1289,10 +1119,7 @@ def train_one_epoch(
 
         if not args.distributed:
             losses_m.update(loss[0].item(), input.size(0))
-            # losses_m.update(loss[0].item() * accum_steps, input.size(0))
-            losses_dict_m.update(loss[1].item(), input.size(0))
-            losses_kl_m.update(loss[2].item(), input.size(0))
-            losses_feature_m.update(loss[3].item(), input.size(0))
+            losses_kl_m.update(loss[1].item(), input.size(0))
 
         update_sample_count += input.size(0)
 
@@ -1320,13 +1147,7 @@ def train_one_epoch(
                 losses_m.update(reduced_loss.item() * accum_steps, input.size(0))
 
                 reduced_loss = utils.reduce_tensor(loss[1].data, args.world_size)
-                losses_dict_m.update(reduced_loss.item()* accum_steps, input.size(0))
-
-                reduced_loss = utils.reduce_tensor(loss[2].data, args.world_size)
                 losses_kl_m.update(reduced_loss.item()* accum_steps, input.size(0))
-
-                reduced_loss = utils.reduce_tensor(loss[3].data, args.world_size)
-                losses_feature_m.update(reduced_loss.item()* accum_steps, input.size(0))
 
                 update_sample_count *= args.world_size
 
@@ -1336,9 +1157,7 @@ def train_one_epoch(
                     f'T: {epoch} [{update_idx:>4d}/{updates_per_epoch} '
                     f'({100. * update_idx / (updates_per_epoch - 1):>3.0f}%)] '
                     f'Ls: {losses_m.val:#.3g} ({losses_m.avg:#.3g}) '
-                    f'Ld: {losses_dict_m.val:#.3g} ({losses_dict_m.avg:#.3g}) '
                     f'Lk: {losses_kl_m.val:#.3g} ({losses_kl_m.avg:#.3g}) '
-                    f'Lf: {losses_feature_m.val:#.3g} ({losses_feature_m.avg:#.3g}) '
                     f'Tm: {update_time_m.val:.3f}s, {update_sample_count / update_time_m.val:>7.2f}/s '
                     f'({update_time_m.avg:.3f}s, {update_sample_count / update_time_m.avg:>7.2f}/s) '
                     f'LR: {lr:.3e} '

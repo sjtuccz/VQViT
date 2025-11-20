@@ -64,7 +64,8 @@ class PatchEmbed(nn.Module):
 
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias)
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
-
+        self.embed_dim = embed_dim
+        self.in_chans = in_chans
     def forward(self, x):
         B, C, H, W = x.shape
         if self.img_size is not None:
@@ -91,6 +92,12 @@ class PatchEmbed(nn.Module):
             x = nchw_to(x, self.output_fmt)
         x = self.norm(x)
         return x
+    def flops(self):
+        Ho, Wo = self.grid_size
+        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
+        if self.norm and not isinstance(self.norm, nn.Identity):
+            flops += Ho * Wo * self.embed_dim
+        return flops
 
 
 class PatchEmbedWithSize(PatchEmbed):
