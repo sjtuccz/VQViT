@@ -393,7 +393,7 @@ class TQ_MetaFormerBlock_TQ_FFN(nn.Module):
             layer_scale_init_value=None,
             res_scale_init_value=None,
 
-            tq_type='tq_qd',tq_level = [3,3,3,3],
+            tq_type='TQ',tq_level = [5,5,5,5],
             dic_n=None, dic_dim=4, tq_Tinit=1,
 
             **kwargs
@@ -501,7 +501,7 @@ class TQ_MetaFormerStage(nn.Module):
             layer_scale_init_value=None,
             res_scale_init_value=None,
 
-            tq_type='tq_qd',tq_level = [3,3,3,3],
+            tq_type='TQ',tq_level = [5,5,5,5],
             dic_n=None, dic_dim=4, tq_Tinit=1,
 
             start_tq_ffn_index=0,
@@ -639,7 +639,7 @@ class TQ_MetaFormer(nn.Module):
             output_norm=LayerNorm2d,
             use_mlp_head=True,
 
-            tq_type='tq_qd',tq_level = [3,3,3,3],
+            tq_type='TQ',tq_level = [5,5,5,5],
             dic_n=None, dic_dim=4, tq_Tinit=1,
 
             start_tq_ffn_index=0,

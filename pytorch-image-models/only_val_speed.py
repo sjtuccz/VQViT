@@ -75,7 +75,7 @@ parser.add_argument('--img-size', default=None, type=int,
                     metavar='N', help='Input image dimension, uses model default if empty')
 parser.add_argument('--in-chans', type=int, default=None, metavar='N',
                     help='Image input channels (default: None => 3)')
-parser.add_argument('--input-size', default=[3, 224, 224], nargs=3, type=int,
+parser.add_argument('--input-size', default=None, nargs=3, type=int,
                     metavar='N N N', help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
 parser.add_argument('--use-train-size', action='store_true', default=False,
                     help='force use of train input size, even when test size is specified in pretrained cfg')
@@ -362,16 +362,21 @@ def validate(args):
             tq_timer.reset()
         # tq_timer.reset()
     print(f"Speed Test {num_batches} batch...")
-    start_time = time.time()
+    total_time = []
     with torch.no_grad():
         for _ in tqdm(range(num_batches), desc="Throughput", unit="batch"):
+            start_time = time.time()
             _ = model(dummy_input)
-    if device == 'cuda':
-        torch.cuda.synchronize()
-    end_time = time.time()
-    total_time = end_time - start_time
+            torch.cuda.synchronize()
+            end_time = time.time()
+            total_time.append(end_time-start_time)
+    # if device == 'cuda':
+    #     torch.cuda.synchronize()
+    # end_time = time.time()
+    # print(total_time)
+    total_time_ = sum(total_time)
     total_images = B * num_batches
-    throughput = total_images / total_time  # images/sec
+    throughput = total_images / total_time_
 
     if hasattr(model, 'timer') and model.timer:
         model.timer.print_summary()

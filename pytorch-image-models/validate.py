@@ -76,11 +76,11 @@ parser.add_argument('--img-size', default=None, type=int,
                     metavar='N', help='Input image dimension, uses model default if empty')
 parser.add_argument('--in-chans', type=int, default=None, metavar='N',
                     help='Image input channels (default: None => 3)')
-parser.add_argument('--input-size', default=[3, 224, 224], nargs=3, type=int,
+parser.add_argument('--input-size', default=None, nargs=3, type=int,
                     metavar='N N N', help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
 parser.add_argument('--use-train-size', action='store_true', default=False,
                     help='force use of train input size, even when test size is specified in pretrained cfg')
-parser.add_argument('--crop-pct', default=0.875, type=float,
+parser.add_argument('--crop-pct', default=None, type=float,
                     metavar='N', help='Input image center crop pct')
 parser.add_argument('--crop-mode', default=None, type=str,
                     metavar='N', help='Input image crop mode (squash, border, center). Model default if None.')
@@ -571,8 +571,6 @@ def main():
         args.num_classes = 200
     elif 'imagenet1k' in args.dataset:
         args.data_dir = '../../ImageNet2012/' if not args.data_dir else args.data_dir
-        args.mean = IMAGENET_DEFAULT_MEAN if not args.mean else args.mean
-        args.std = IMAGENET_DEFAULT_STD if not args.std else args.std
         args.num_classes = 1000
     elif 'imagenet100' in args.dataset:
         args.data_dir = '../../imagenet100/' if not args.data_dir else args.data_dir

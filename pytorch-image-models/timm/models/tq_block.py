@@ -8,7 +8,7 @@ from timm.layers import trunc_normal_
 
 
 def choose_tq(tq_type, dic_n, dim, dic_dim, tq_level=[3,3,3,3], tq_Tinit=1, input_format='NLC'):
-    if tq_type == 'tq_qd' or tq_type == 'TQ':
+    if tq_type == 'TQ' or tq_type == 'tq':
         return TQ_Qscale_deQscale(channels_in=dim, channels_dim=dic_dim, levels=tq_level, T=tq_Tinit, input_format=input_format)
     else:
         raise RuntimeError('tq type not implemented')
@@ -122,6 +122,8 @@ class TQ_Qscale_deQscale(nn.Module):
         """ Quantizes z, returns quantized zhat, same shape as z. """
         if self.token_wise_rep:
             return z.mul_(self._inv_T_raw).tanh_().mul_(self.half_l).round().mul_(self._inv_scale_factor)
+        # return self.round_ste((2*torch.sigmoid(1.6*z)-1) * self.half_l)/ self.half_l
+        # return self.round_ste((2*torch.sigmoid(1.6*z/self.T_raw)-1) * self.half_l)/ self.half_l *self.anti_q
         return self.round_ste(torch.tanh(z/self.T_raw) * self.half_l)/ self.half_l *self.anti_q
 
     def codes_to_indices(self, zhat):

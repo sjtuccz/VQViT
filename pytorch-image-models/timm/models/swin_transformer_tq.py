@@ -215,9 +215,9 @@ class tqWindowAttention(nn.Module):
             attn_drop: float = 0.,
             proj_drop: float = 0.,
 
-            tq_type='tq_qd',
-            tq_level = [3,3,3,3],
-            dic_n=None, dic_dim=3, tq_Tinit=1
+            tq_type='TQ',
+            tq_level = [5,5,5,5],
+            dic_n=None, dic_dim=4, tq_Tinit=1
     ):
         """
         Args:
@@ -532,9 +532,9 @@ class TQ_SwinTransformerBlock_TQ_ATTN(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = nn.LayerNorm,
 
-            tq_type='tq_qd',
-            tq_level = [3,3,3,3],
-            dic_n=None, dic_dim=3, tq_Tinit=1
+            tq_type='TQ',
+            tq_level = [5,5,5,5],
+            dic_n=None, dic_dim=4, tq_Tinit=1
     ):
         """
         Args:
@@ -712,7 +712,7 @@ class TQ_SwinTransformerBlock_TQ_FFN(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = nn.LayerNorm,
 
-            tq_type='tq_qd',tq_level = [3,3,3,3],
+            tq_type='TQ',tq_level = [5,5,5,5],
             dic_n=None, dic_dim=4, tq_Tinit=1
     ):
         """
@@ -938,7 +938,7 @@ class TQ_SwinTransformerStage(nn.Module):
             drop_path: Union[List[float], float] = 0.,
             norm_layer: Callable = nn.LayerNorm,
 
-            tq_type='tq_qd',tq_level = [3,3,3,3],
+            tq_type='TQ',tq_level = [5,5,5,5],
             dic_n=None, dic_dim=4, tq_Tinit=1
     ):
         """
@@ -1064,7 +1064,7 @@ class TQ_SwinTransformer(nn.Module):
             norm_layer: Union[str, Callable] = nn.LayerNorm,
             weight_init: str = '',
 
-            tq_type='tq_qd',tq_level = [3,3,3,3],
+            tq_type='TQ',tq_level = [5,5,5,5],
             dic_n=None, dic_dim=4, tq_Tinit=1,
             **kwargs,
     ):

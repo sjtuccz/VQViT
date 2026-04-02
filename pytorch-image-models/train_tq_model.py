@@ -134,10 +134,10 @@ group.add_argument('--img-size', type=int, default=None, metavar='N',
                    help='Image size (default: None => model default)')
 group.add_argument('--in-chans', type=int, default=None, metavar='N',
                    help='Image input channels (default: None => 3)')
-group.add_argument('--input-size', default=[3,224,224], nargs=3, type=int,
+group.add_argument('--input-size', default=None, nargs=3, type=int,
                    metavar='N N N',
                    help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
-group.add_argument('--crop-pct', default=0.875, type=float,
+group.add_argument('--crop-pct', default=None, type=float,
                    metavar='N', help='Input image center crop percent (for validation only)')
 group.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
                    help='Override mean pixel value of dataset')
@@ -475,8 +475,8 @@ def main():
         args.num_classes = 200
     elif 'imagenet1k' in args.dataset:
         args.data_dir = '../../ImageNet2012/' if not args.data_dir else args.data_dir
-        args.mean = IMAGENET_DEFAULT_MEAN if not args.mean else args.mean
-        args.std = IMAGENET_DEFAULT_STD if not args.std else args.std
+        # args.mean = IMAGENET_DEFAULT_MEAN if not args.mean else args.mean
+        # args.std = IMAGENET_DEFAULT_STD if not args.std else args.std
         args.num_classes = 1000
     elif 'imagenet100' in args.dataset:
         args.data_dir = '../../imagenet100/' if not args.data_dir else args.data_dir
