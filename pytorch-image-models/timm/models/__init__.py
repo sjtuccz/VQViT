@@ -7,6 +7,7 @@ from .coat import *
 from .convit import *
 from .convmixer import *
 from .convnext import *
+from .convnext_tq import *
 from .crossvit import *
 from .cspnet import *
 from .davit import *

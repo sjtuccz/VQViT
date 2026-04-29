@@ -1,16 +1,16 @@
 """ TQ_ConvNeXt: Doing...
 """
-# ConvNeXt
+# TQ_ConvNeXt
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 # This source code is licensed under the MIT license
 
-# ConvNeXt-V2
+# TQ_ConvNeXt-V2
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree (Attribution-NonCommercial 4.0 International (CC BY-NC 4.0))
-# No code was used directly from ConvNeXt-V2, however the weights are CC BY-NC 4.0 so beware if using commercially.
+# No code was used directly from TQ_ConvNeXt-V2, however the weights are CC BY-NC 4.0 so beware if using commercially.
 
 from collections import OrderedDict
 from functools import partial
@@ -26,8 +26,8 @@ from timm.layers import NormMlpClassifierHead, ClassifierHead
 from ._builder import build_model_with_cfg
 from ._manipulate import named_apply, checkpoint_seq
 from ._registry import generate_default_cfgs, register_model, register_model_deprecations
-
-__all__ = ['ConvNeXt']  # model_registry will add each entrypoint fn to this
+from timm.models.tq_block import choose_tq
+__all__ = ['TQ_ConvNeXt']  # model_registry will add each entrypoint fn to this
 
 
 class Downsample(nn.Module):
@@ -53,7 +53,7 @@ class Downsample(nn.Module):
 
 
 class ConvNeXtBlock(nn.Module):
-    """ ConvNeXt Block
+    """ TQ_ConvNeXt Block
     There are two equivalent implementations:
       (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
       (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
@@ -90,7 +90,7 @@ class ConvNeXtBlock(nn.Module):
             mlp_ratio: MLP expansion ratio.
             conv_mlp: Use 1x1 convolutions for MLP and a NCHW compatible norm layer if True.
             conv_bias: Apply bias for all convolution (linear) layers.
-            use_grn: Use GlobalResponseNorm in MLP (from ConvNeXt-V2)
+            use_grn: Use GlobalResponseNorm in MLP (from TQ_ConvNeXt-V2)
             ls_init_value: Layer-scale init values, layer-scale applied if not None.
             act_layer: Activation layer.
             norm_layer: Normalization layer (defaults to LN if not specified).
@@ -129,18 +129,163 @@ class ConvNeXtBlock(nn.Module):
             x = self.norm(x)
             x = self.mlp(x)
         else:
-            x = x.permute(0, 2, 3, 1)
+            x = x.permute(0, 2, 3, 1).contiguous()
             x = self.norm(x)
             x = self.mlp(x)
-            x = x.permute(0, 3, 1, 2)
+            x = x.permute(0, 3, 1, 2).contiguous()
         if self.gamma is not None:
+            x = x.mul(self.gamma.reshape(1, -1, 1, 1))
+
+        x = self.drop_path(x) + self.shortcut(shortcut)
+        return x
+class TQ_ConvNeXtBlock(nn.Module):
+    """ TQ_ConvNeXt TQ Block, only tq MLP
+    There are two equivalent implementations:
+      (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
+      (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
+
+    Unlike the official impl, this one allows choice of 1 or 2, 1x1 conv can be faster with appropriate
+    choice of LayerNorm impl, however as model size increases the tradeoffs appear to change and nn.Linear
+    is a better choice. This was observed with PyTorch 1.10 on 3090 GPU, it could change over time & w/ different HW.
+    """
+
+    def __init__(
+            self,
+            in_chs: int,
+            out_chs: Optional[int] = None,
+            kernel_size: int = 7,
+            stride: int = 1,
+            dilation: Union[int, Tuple[int, int]] = (1, 1),
+            mlp_ratio: float = 4,
+            conv_mlp: bool = False,
+            conv_bias: bool = True,
+            use_grn: bool = False,
+            ls_init_value: Optional[float] = 1e-6,
+            act_layer: Union[str, Callable] = 'gelu',
+            norm_layer: Optional[Callable] = None,
+            drop_path: float = 0.,
+
+            tq_type='TQ',tq_level = [5,5,5,5],
+            dic_n=None, dic_dim=4, tq_Tinit=1,
+    ):
+        """
+
+        Args:
+            in_chs: Block input channels.
+            out_chs: Block output channels (same as in_chs if None).
+            kernel_size: Depthwise convolution kernel size.
+            stride: Stride of depthwise convolution.
+            dilation: Tuple specifying input and output dilation of block.
+            mlp_ratio: MLP expansion ratio.
+            conv_mlp: Use 1x1 convolutions for MLP and a NCHW compatible norm layer if True.
+            conv_bias: Apply bias for all convolution (linear) layers.
+            use_grn: Use GlobalResponseNorm in MLP (from TQ_ConvNeXt-V2)
+            ls_init_value: Layer-scale init values, layer-scale applied if not None.
+            act_layer: Activation layer.
+            norm_layer: Normalization layer (defaults to LN if not specified).
+            drop_path: Stochastic depth probability.
+        """
+        super().__init__()
+        out_chs = out_chs or in_chs
+        dilation = to_ntuple(2)(dilation)
+        act_layer = get_act_layer(act_layer)
+        if not norm_layer:
+            norm_layer = LayerNorm2d if conv_mlp else LayerNorm
+        assert not use_grn, 'GRN not supported in TQ block, use regular TQ_ConvNeXtBlock for that'
+        mlp_layer = partial(GlobalResponseNormMlp if use_grn else Mlp, use_conv=conv_mlp)
+        self.use_conv_mlp = conv_mlp
+        self.conv_dw = create_conv2d(
+            in_chs,
+            out_chs,
+            kernel_size=kernel_size,
+            stride=stride,
+            dilation=dilation[0],
+            depthwise=True,
+            bias=conv_bias,
+        )
+        self.norm = norm_layer(out_chs)
+        self.mlp = mlp_layer(out_chs, int(mlp_ratio * out_chs), act_layer=act_layer)
+        self.gamma = nn.Parameter(ls_init_value * torch.ones(out_chs)) if ls_init_value is not None else None
+        if in_chs != out_chs or stride != 1 or dilation[0] != dilation[1]:
+            self.shortcut = Downsample(in_chs, out_chs, stride=stride, dilation=dilation[0])
+        else:
+            self.shortcut = nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.tq = choose_tq(tq_type=tq_type, dic_n=dic_n, dim=out_chs, dic_dim=dic_dim, tq_level=tq_level, tq_Tinit=tq_Tinit, input_format='NCHW' if conv_mlp else'NHWC')
+        self.token_wise_rep = False
+        self.dim = out_chs
+        self.register_buffer("rep_codebook", torch.tensor(0))
+
+    def reparameterize(self):
+        ''' 
+        reparameterize the tq dict and calculate the rep_codebook for inference, 
+        the case where the codebook is not a square matrix has also been taken into consideration. 
+        '''
+        print('using TQ-ConvnextBlock reparameterize')
+        self.token_wise_rep = True
+        # self.rep_codebook = nn.Embedding(self.tq.codebook_size, self.dim)
+        fixed_codebook = self.tq.reparameterize() # (codebook size, dim)
+        if self.use_conv_mlp: # mlp是卷积 nchw 格式
+            HW, C = fixed_codebook.shape[0], fixed_codebook.shape[1]
+            fixed_codebook_transposed = fixed_codebook.transpose(0, 1).contiguous() # (C, HW)
+            h = int(torch.sqrt(torch.tensor(HW)).ceil().item())
+            w = (HW + h - 1) // h
+            if h * w > HW:
+                pad_size = h * w - HW
+                x_padded = torch.cat([fixed_codebook_transposed, torch.zeros(C, pad_size, device=fixed_codebook_transposed.device)], dim=1)
+            else:
+                x_padded = fixed_codebook_transposed
+            fixed_codebook_rep = x_padded.reshape(1, C,h,w) # (1, C, h, w)
+            x = self.mlp(fixed_codebook_rep)
+            if self.gamma is not None:
+                x = x.mul(self.gamma.reshape(1, -1, 1, 1))
+            x = x.reshape(C, -1) # (C, HW)
+            if h * w > HW:
+                x = x[:, :HW].contiguous() # (C, HW)
+            x = x.transpose(0, 1).contiguous() # (HW, C)
+        else: # mlp是线性层，(N, HW, C)格式
+            x = self.mlp(fixed_codebook) # (HW, C)
+            if self.gamma is not None:
+                x = x.mul(self.gamma.reshape(1, -1)) # (HW, C)
+            self.rep_codebook=x.data.contiguous()
+            del self.mlp
+            del self.gamma
+
+
+    def forward(self, x):
+        shortcut = x
+        x_conv_dw = self.conv_dw(x)
+        if self.use_conv_mlp:
+            x = self.norm(x_conv_dw)
+            if self.token_wise_rep:
+                embedding_index =  self.tq(x)
+                z_q = self.rep_codebook[embedding_index] # (N, H*W, C)
+                x = z_q.transpose(1, 2).reshape(x_conv_dw.shape) # (N, H*W, C) -> (N, C, H, W)
+            else:
+                x = self.tq(x)
+                x = self.mlp(x)
+        else:
+            x_nhwc = x_conv_dw.permute(0, 2, 3, 1).contiguous() # (N, C, H, W) -> (N, H, W, C)
+            x = self.norm(x_nhwc)
+            if self.token_wise_rep:
+                embedding_index =  self.tq(x)
+                z_q = self.rep_codebook[embedding_index] # (N, H*W, C)
+                x = z_q.reshape(x_nhwc.shape)# (N, H*W, C) -> (N, H, W, C)
+            else:
+                x = self.tq(x)
+                x = self.mlp(x)
+            x = x.permute(0, 3, 1, 2).contiguous() # (N, H, W, C) -> (N, C, H, W)
+
+
+        if not self.token_wise_rep and self.gamma is not None:
             x = x.mul(self.gamma.reshape(1, -1, 1, 1))
 
         x = self.drop_path(x) + self.shortcut(shortcut)
         return x
 
 
-class ConvNeXtStage(nn.Module):
+class TQ_ConvNeXtStage(nn.Module):
 
     def __init__(
             self,
@@ -148,7 +293,8 @@ class ConvNeXtStage(nn.Module):
             out_chs,
             kernel_size=7,
             stride=2,
-            depth=2,
+            all_stage_depth=(3, 3, 9, 3),
+            stage_index=0,
             dilation=(1, 1),
             drop_path_rates=None,
             ls_init_value=1.0,
@@ -180,26 +326,47 @@ class ConvNeXtStage(nn.Module):
             in_chs = out_chs
         else:
             self.downsample = nn.Identity()
-
+        depth = all_stage_depth[stage_index]
         drop_path_rates = drop_path_rates or [0.] * depth
         stage_blocks = []
         for i in range(depth):
-            stage_blocks.append(ConvNeXtBlock(
-                in_chs=in_chs,
-                out_chs=out_chs,
-                kernel_size=kernel_size,
-                dilation=dilation[1],
-                drop_path=drop_path_rates[i],
-                ls_init_value=ls_init_value,
-                conv_mlp=conv_mlp,
-                conv_bias=conv_bias,
-                use_grn=use_grn,
-                act_layer=act_layer,
-                norm_layer=norm_layer if conv_mlp else norm_layer_cl,
-            ))
+            sum_depth_index = sum(all_stage_depth[:stage_index])+i
+            if sum_depth_index%2==0:
+                stage_blocks.append(TQ_ConvNeXtBlock(
+                    in_chs=in_chs,
+                    out_chs=out_chs,
+                    kernel_size=kernel_size,
+                    dilation=dilation[1],
+                    drop_path=drop_path_rates[i],
+                    ls_init_value=ls_init_value,
+                    conv_mlp=conv_mlp,
+                    conv_bias=conv_bias,
+                    use_grn=use_grn,
+                    act_layer=act_layer,
+                    norm_layer=norm_layer if conv_mlp else norm_layer_cl,
+                ))
+            else:
+                stage_blocks.append(ConvNeXtBlock(
+                    in_chs=in_chs,
+                    out_chs=out_chs,
+                    kernel_size=kernel_size,
+                    dilation=dilation[1],
+                    drop_path=drop_path_rates[i],
+                    ls_init_value=ls_init_value,
+                    conv_mlp=conv_mlp,
+                    conv_bias=conv_bias,
+                    use_grn=use_grn,
+                    act_layer=act_layer,
+                    norm_layer=norm_layer if conv_mlp else norm_layer_cl,
+                ))
             in_chs = out_chs
         self.blocks = nn.Sequential(*stage_blocks)
-
+        self.token_wise_rep = False
+    def reparameterize(self):
+        self.token_wise_rep = True
+        for block in self.blocks:
+            if hasattr(block, 'reparameterize'):
+                block.reparameterize()
     def forward(self, x):
         x = self.downsample(x)
         if self.grad_checkpointing and not torch.jit.is_scripting():
@@ -209,8 +376,8 @@ class ConvNeXtStage(nn.Module):
         return x
 
 
-class ConvNeXt(nn.Module):
-    r""" ConvNeXt
+class TQ_ConvNeXt(nn.Module):
+    r""" TQ_ConvNeXt
         A PyTorch impl of : `A ConvNet for the 2020s`  - https://arxiv.org/pdf/2201.03545.pdf
     """
 
@@ -237,6 +404,10 @@ class ConvNeXt(nn.Module):
             norm_eps: Optional[float] = None,
             drop_rate: float = 0.,
             drop_path_rate: float = 0.,
+
+            dic_dim=4,
+            tq_type='TQ',
+            tq_level=[5,5,5,5],
     ):
         """
         Args:
@@ -313,13 +484,14 @@ class ConvNeXt(nn.Module):
             curr_stride *= stride
             first_dilation = 1 if dilation in (1, 2) else 2
             out_chs = dims[i]
-            stages.append(ConvNeXtStage(
+            stages.append(TQ_ConvNeXtStage(
                 prev_chs,
                 out_chs,
                 kernel_size=kernel_sizes[i],
                 stride=stride,
                 dilation=(first_dilation, dilation),
-                depth=depths[i],
+                all_stage_depth=depths,
+                stage_index=i,
                 drop_path_rates=dp_rates[i],
                 ls_init_value=ls_init_value,
                 conv_mlp=conv_mlp,
@@ -336,7 +508,7 @@ class ConvNeXt(nn.Module):
         self.num_features = prev_chs
 
         # if head_norm_first == true, norm -> global pool -> fc ordering, like most other nets
-        # otherwise pool -> norm -> fc, the default ConvNeXt ordering (pretrained FB weights)
+        # otherwise pool -> norm -> fc, the default TQ_ConvNeXt ordering (pretrained FB weights)
         if head_norm_first:
             assert not head_hidden_size
             self.norm_pre = norm_layer(self.num_features)
@@ -358,7 +530,7 @@ class ConvNeXt(nn.Module):
                 act_layer='gelu',
             )
         named_apply(partial(_init_weights, head_init_scale=head_init_scale), self)
-
+        self.token_wise_rep = False
     @torch.jit.ignore
     def group_matcher(self, coarse=False):
         return dict(
@@ -395,6 +567,40 @@ class ConvNeXt(nn.Module):
         x = self.forward_features(x)
         x = self.forward_head(x)
         return x
+    def reparameterize(self):
+        self.token_wise_rep = True
+        for stage in self.stages: 
+            print(f"Found module: {stage.__class__.__name__.lower()}, {isinstance(stage, nn.Sequential)}")
+            if isinstance(stage, nn.Sequential):
+                for name, block in stage.named_children():
+                    if hasattr(block, 'reparameterize'):
+                        print(f"        Found TQ module in Sequential: {block.__class__.__name__.lower()}")
+                        block.reparameterize()
+            else:
+                if hasattr(stage, 'reparameterize'):
+                    stage.reparameterize()
+
+    def print_codebook_utilization(self):
+        sum_util = 0.0
+        average_util = 0.0
+        count = 0
+        found_modules = []  # 用于记录找到的模块及其路径
+        # 递归遍历所有子模块
+        for module_name, module in self.named_modules():
+            # 检查模块是否是 TQ 实例（根据您的类名调整条件）
+            # 例如，如果您的TQ类名为 VectorQuantizer：
+            if hasattr(module, 'codebook_meter'): # 或者使用 isinstance(module, VectorQuantizer)
+                utilization = module.codebook_meter.utilization # 注意：这里是属性，不是方法调用
+                print(f'TQ  Module [{module_name}] Codebook Utilization: {utilization * 100:.2f}%')
+                found_modules.append(module_name)
+                sum_util += utilization
+                count += 1
+        if count > 0:
+            average_util = sum_util / count
+            print(f'Average TQ Codebook Utilization (across {count} modules): {average_util*100:.2f}%')
+        else:
+            print('No TQ modules with codebook meters found.')
+        return average_util
 
 
 def _init_weights(module, name=None, head_init_scale=1.0):
@@ -452,14 +658,14 @@ def checkpoint_filter_fn(state_dict, model):
     return out_dict
 
 
-def _create_convnext(variant, pretrained=False, **kwargs):
+def _create_tq_convnext(variant, pretrained=False, **kwargs):
     if kwargs.get('pretrained_cfg', '') == 'fcmae':
         # NOTE fcmae pretrained weights have no classifier or final norm-layer (`head.norm`)
         # This is workaround loading with num_classes=0 w/o removing norm-layer.
         kwargs.setdefault('pretrained_strict', False)
 
     model = build_model_with_cfg(
-        ConvNeXt, variant, pretrained,
+        TQ_ConvNeXt, variant, pretrained,
         pretrained_filter_fn=checkpoint_filter_fn,
         feature_cfg=dict(out_indices=(0, 1, 2, 3), flatten_sequential=True),
         **kwargs)
@@ -470,604 +676,43 @@ def _cfg(url='', **kwargs):
     return {
         'url': url,
         'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
-        'crop_pct': 0.875, 'interpolation': 'bicubic',
+        'crop_pct': 0.95, 'interpolation': 'bicubic',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'stem.0', 'classifier': 'head.fc',
         **kwargs
     }
-
-
-def _cfgv2(url='', **kwargs):
-    return {
-        'url': url,
-        'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
-        'crop_pct': 0.875, 'interpolation': 'bicubic',
-        'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
-        'first_conv': 'stem.0', 'classifier': 'head.fc',
-        'license': 'cc-by-nc-4.0', 'paper_ids': 'arXiv:2301.00808',
-        'paper_name': 'ConvNeXt-V2: Co-designing and Scaling ConvNets with Masked Autoencoders',
-        'origin_url': 'https://github.com/facebookresearch/ConvNeXt-V2',
-        **kwargs
-    }
-
 
 default_cfgs = generate_default_cfgs({
-    # timm specific variants
-    'convnext_tiny.in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        crop_pct=0.95, test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_small.in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        crop_pct=0.95, test_input_size=(3, 288, 288), test_crop_pct=1.0),
-
-    'convnext_atto.d2_in1k': _cfg(
-        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_atto_d2-01bb0f51.pth',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=0.95),
-    'convnext_atto_ols.a2_in1k': _cfg(
-        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_atto_ols_a2-78d1c8f3.pth',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=0.95),
-    'convnext_femto.d1_in1k': _cfg(
-        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_femto_d1-d71d5b4c.pth',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=0.95),
-    'convnext_femto_ols.d1_in1k': _cfg(
-        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_femto_ols_d1-246bf2ed.pth',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=0.95),
-    'convnext_pico.d1_in1k': _cfg(
-        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_pico_d1-10ad7f0d.pth',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=0.95),
-    'convnext_pico_ols.d1_in1k': _cfg(
-        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_pico_ols_d1-611f0ca7.pth',
-        hf_hub_id='timm/',
-        crop_pct=0.95, test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_nano.in12k_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        crop_pct=0.95, test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_nano.d1h_in1k': _cfg(
-        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_nano_d1h-7eb4bdea.pth',
-        hf_hub_id='timm/',
-        crop_pct=0.95, test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_nano_ols.d1h_in1k': _cfg(
-        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_nano_ols_d1h-ae424a9a.pth',
-        hf_hub_id='timm/',
-        crop_pct=0.95, test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_tiny_hnf.a2h_in1k': _cfg(
-        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/convnext_tiny_hnf_a2h-ab7e9df2.pth',
-        hf_hub_id='timm/',
-        crop_pct=0.95, test_input_size=(3, 288, 288), test_crop_pct=1.0),
-
-    'convnext_tiny.in12k_ft_in1k_384': _cfg(
-        hf_hub_id='timm/',
-       input_size=(3, 384, 384), pool_size=(12, 12),  crop_pct=1.0, crop_mode='squash'),
-    'convnext_small.in12k_ft_in1k_384': _cfg(
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0,  crop_mode='squash'),
-
-    'convnext_nano.in12k': _cfg(
-        hf_hub_id='timm/',
-        crop_pct=0.95, num_classes=11821),
-    'convnext_tiny.in12k': _cfg(
-        hf_hub_id='timm/',
-        crop_pct=0.95, num_classes=11821),
-    'convnext_small.in12k': _cfg(
-        hf_hub_id='timm/',
-        crop_pct=0.95, num_classes=11821),
-
-    'convnext_tiny.fb_in22k_ft_in1k': _cfg(
-        url='https://dl.fbaipublicfiles.com/convnext/convnext_tiny_22k_1k_224.pth',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_small.fb_in22k_ft_in1k': _cfg(
-        url='https://dl.fbaipublicfiles.com/convnext/convnext_small_22k_1k_224.pth',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_base.fb_in22k_ft_in1k': _cfg(
-        url='https://dl.fbaipublicfiles.com/convnext/convnext_base_22k_1k_224.pth',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_large.fb_in22k_ft_in1k': _cfg(
-        url='https://dl.fbaipublicfiles.com/convnext/convnext_large_22k_1k_224.pth',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_xlarge.fb_in22k_ft_in1k': _cfg(
-        url='https://dl.fbaipublicfiles.com/convnext/convnext_xlarge_22k_1k_224_ema.pth',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-
-    'convnext_tiny.fb_in1k': _cfg(
-        url="https://dl.fbaipublicfiles.com/convnext/convnext_tiny_1k_224_ema.pth",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_small.fb_in1k': _cfg(
-        url="https://dl.fbaipublicfiles.com/convnext/convnext_small_1k_224_ema.pth",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_base.fb_in1k': _cfg(
-        url="https://dl.fbaipublicfiles.com/convnext/convnext_base_1k_224_ema.pth",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnext_large.fb_in1k': _cfg(
-        url="https://dl.fbaipublicfiles.com/convnext/convnext_large_1k_224_ema.pth",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-
-    'convnext_tiny.fb_in22k_ft_in1k_384': _cfg(
-        url='https://dl.fbaipublicfiles.com/convnext/convnext_tiny_22k_1k_384.pth',
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnext_small.fb_in22k_ft_in1k_384': _cfg(
-        url='https://dl.fbaipublicfiles.com/convnext/convnext_small_22k_1k_384.pth',
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnext_base.fb_in22k_ft_in1k_384': _cfg(
-        url='https://dl.fbaipublicfiles.com/convnext/convnext_base_22k_1k_384.pth',
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnext_large.fb_in22k_ft_in1k_384': _cfg(
-        url='https://dl.fbaipublicfiles.com/convnext/convnext_large_22k_1k_384.pth',
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnext_xlarge.fb_in22k_ft_in1k_384': _cfg(
-        url='https://dl.fbaipublicfiles.com/convnext/convnext_xlarge_22k_1k_384_ema.pth',
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-
-    'convnext_tiny.fb_in22k': _cfg(
-        url="https://dl.fbaipublicfiles.com/convnext/convnext_tiny_22k_224.pth",
-        hf_hub_id='timm/',
-        num_classes=21841),
-    'convnext_small.fb_in22k': _cfg(
-        url="https://dl.fbaipublicfiles.com/convnext/convnext_small_22k_224.pth",
-        hf_hub_id='timm/',
-        num_classes=21841),
-    'convnext_base.fb_in22k': _cfg(
-        url="https://dl.fbaipublicfiles.com/convnext/convnext_base_22k_224.pth",
-        hf_hub_id='timm/',
-        num_classes=21841),
-    'convnext_large.fb_in22k': _cfg(
-        url="https://dl.fbaipublicfiles.com/convnext/convnext_large_22k_224.pth",
-        hf_hub_id='timm/',
-        num_classes=21841),
-    'convnext_xlarge.fb_in22k': _cfg(
-        url="https://dl.fbaipublicfiles.com/convnext/convnext_xlarge_22k_224.pth",
-        hf_hub_id='timm/',
-        num_classes=21841),
-
-    'convnextv2_nano.fcmae_ft_in22k_in1k': _cfgv2(
-        url='https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_nano_22k_224_ema.pt',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnextv2_nano.fcmae_ft_in22k_in1k_384': _cfgv2(
-        url='https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_nano_22k_384_ema.pt',
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnextv2_tiny.fcmae_ft_in22k_in1k': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_tiny_22k_224_ema.pt",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnextv2_tiny.fcmae_ft_in22k_in1k_384': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_tiny_22k_384_ema.pt",
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnextv2_base.fcmae_ft_in22k_in1k': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_base_22k_224_ema.pt",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnextv2_base.fcmae_ft_in22k_in1k_384': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_base_22k_384_ema.pt",
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnextv2_large.fcmae_ft_in22k_in1k': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_large_22k_224_ema.pt",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnextv2_large.fcmae_ft_in22k_in1k_384': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_large_22k_384_ema.pt",
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnextv2_huge.fcmae_ft_in22k_in1k_384': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_huge_22k_384_ema.pt",
-        hf_hub_id='timm/',
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnextv2_huge.fcmae_ft_in22k_in1k_512': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_huge_22k_512_ema.pt",
-        hf_hub_id='timm/',
-        input_size=(3, 512, 512), pool_size=(15, 15), crop_pct=1.0, crop_mode='squash'),
-
-    'convnextv2_atto.fcmae_ft_in1k': _cfgv2(
-        url='https://dl.fbaipublicfiles.com/convnext/convnextv2/im1k/convnextv2_atto_1k_224_ema.pt',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=0.95),
-    'convnextv2_femto.fcmae_ft_in1k': _cfgv2(
-        url='https://dl.fbaipublicfiles.com/convnext/convnextv2/im1k/convnextv2_femto_1k_224_ema.pt',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=0.95),
-    'convnextv2_pico.fcmae_ft_in1k': _cfgv2(
-        url='https://dl.fbaipublicfiles.com/convnext/convnextv2/im1k/convnextv2_pico_1k_224_ema.pt',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=0.95),
-    'convnextv2_nano.fcmae_ft_in1k': _cfgv2(
-        url='https://dl.fbaipublicfiles.com/convnext/convnextv2/im1k/convnextv2_nano_1k_224_ema.pt',
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnextv2_tiny.fcmae_ft_in1k': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im1k/convnextv2_tiny_1k_224_ema.pt",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnextv2_base.fcmae_ft_in1k': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im1k/convnextv2_base_1k_224_ema.pt",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnextv2_large.fcmae_ft_in1k': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im1k/convnextv2_large_1k_224_ema.pt",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'convnextv2_huge.fcmae_ft_in1k': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/im1k/convnextv2_huge_1k_224_ema.pt",
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-
-    'convnextv2_atto.fcmae': _cfgv2(
-        url='https://dl.fbaipublicfiles.com/convnext/convnextv2/pt_only/convnextv2_atto_1k_224_fcmae.pt',
-        hf_hub_id='timm/',
-        num_classes=0),
-    'convnextv2_femto.fcmae': _cfgv2(
-        url='https://dl.fbaipublicfiles.com/convnext/convnextv2/pt_only/convnextv2_femto_1k_224_fcmae.pt',
-        hf_hub_id='timm/',
-        num_classes=0),
-    'convnextv2_pico.fcmae': _cfgv2(
-        url='https://dl.fbaipublicfiles.com/convnext/convnextv2/pt_only/convnextv2_pico_1k_224_fcmae.pt',
-        hf_hub_id='timm/',
-        num_classes=0),
-    'convnextv2_nano.fcmae': _cfgv2(
-        url='https://dl.fbaipublicfiles.com/convnext/convnextv2/pt_only/convnextv2_nano_1k_224_fcmae.pt',
-        hf_hub_id='timm/',
-        num_classes=0),
-    'convnextv2_tiny.fcmae': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/pt_only/convnextv2_tiny_1k_224_fcmae.pt",
-        hf_hub_id='timm/',
-        num_classes=0),
-    'convnextv2_base.fcmae': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/pt_only/convnextv2_base_1k_224_fcmae.pt",
-        hf_hub_id='timm/',
-        num_classes=0),
-    'convnextv2_large.fcmae': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/pt_only/convnextv2_large_1k_224_fcmae.pt",
-        hf_hub_id='timm/',
-        num_classes=0),
-    'convnextv2_huge.fcmae': _cfgv2(
-        url="https://dl.fbaipublicfiles.com/convnext/convnextv2/pt_only/convnextv2_huge_1k_224_fcmae.pt",
-        hf_hub_id='timm/',
-        num_classes=0),
-
-    'convnextv2_small.untrained': _cfg(),
-
-    # CLIP weights, fine-tuned on in1k or in12k + in1k
-    'convnext_base.clip_laion2b_augreg_ft_in12k_in1k': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0),
-    'convnext_base.clip_laion2b_augreg_ft_in12k_in1k_384': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnext_large_mlp.clip_laion2b_soup_ft_in12k_in1k_320': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0),
-    'convnext_large_mlp.clip_laion2b_soup_ft_in12k_in1k_384': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-
-    'convnext_base.clip_laion2b_augreg_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0),
-    'convnext_base.clip_laiona_augreg_ft_in1k_384': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0),
-    'convnext_large_mlp.clip_laion2b_augreg_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0
-    ),
-    'convnext_large_mlp.clip_laion2b_augreg_ft_in1k_384': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'
-    ),
-    'convnext_xxlarge.clip_laion2b_soup_ft_in1k': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0),
-
-    'convnext_base.clip_laion2b_augreg_ft_in12k': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=11821,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0),
-    'convnext_large_mlp.clip_laion2b_soup_ft_in12k_320': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=11821,
-        input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0),
-    'convnext_large_mlp.clip_laion2b_augreg_ft_in12k_384': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=11821,
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnext_large_mlp.clip_laion2b_soup_ft_in12k_384': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=11821,
-        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
-    'convnext_xxlarge.clip_laion2b_soup_ft_in12k': _cfg(
-        hf_hub_id='timm/',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, num_classes=11821,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0),
-
-    # CLIP original image tower weights
-    'convnext_base.clip_laion2b': _cfg(
-        hf_hub_id='laion/CLIP-convnext_base_w-laion2B-s13B-b82K',
-        hf_hub_filename='open_clip_pytorch_model.bin',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=640),
-    'convnext_base.clip_laion2b_augreg': _cfg(
-        hf_hub_id='laion/CLIP-convnext_base_w-laion2B-s13B-b82K-augreg',
-        hf_hub_filename='open_clip_pytorch_model.bin',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=640),
-    'convnext_base.clip_laiona': _cfg(
-        hf_hub_id='laion/CLIP-convnext_base_w-laion_aesthetic-s13B-b82K',
-        hf_hub_filename='open_clip_pytorch_model.bin',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=640),
-    'convnext_base.clip_laiona_320': _cfg(
-        hf_hub_id='laion/CLIP-convnext_base_w_320-laion_aesthetic-s13B-b82K',
-        hf_hub_filename='open_clip_pytorch_model.bin',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0, num_classes=640),
-    'convnext_base.clip_laiona_augreg_320': _cfg(
-        hf_hub_id='laion/CLIP-convnext_base_w_320-laion_aesthetic-s13B-b82K-augreg',
-        hf_hub_filename='open_clip_pytorch_model.bin',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0, num_classes=640),
-    'convnext_large_mlp.clip_laion2b_augreg': _cfg(
-        hf_hub_id='laion/CLIP-convnext_large_d.laion2B-s26B-b102K-augreg',
-        hf_hub_filename='open_clip_pytorch_model.bin',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=768),
-    'convnext_large_mlp.clip_laion2b_ft_320': _cfg(
-        hf_hub_id='laion/CLIP-convnext_large_d_320.laion2B-s29B-b131K-ft',
-        hf_hub_filename='open_clip_pytorch_model.bin',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0, num_classes=768),
-    'convnext_large_mlp.clip_laion2b_ft_soup_320': _cfg(
-        hf_hub_id='laion/CLIP-convnext_large_d_320.laion2B-s29B-b131K-ft-soup',
-        hf_hub_filename='open_clip_pytorch_model.bin',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0, num_classes=768),
-    'convnext_xxlarge.clip_laion2b_soup': _cfg(
-        hf_hub_id='laion/CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-soup',
-        hf_hub_filename='open_clip_pytorch_model.bin',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=1024),
-    'convnext_xxlarge.clip_laion2b_rewind': _cfg(
-        hf_hub_id='laion/CLIP-convnext_xxlarge-laion2B-s34B-b82K-augreg-rewind',
-        hf_hub_filename='open_clip_pytorch_model.bin',
-        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
-        input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=1.0, num_classes=1024),
+    # inputsize 3 224 224, crop-pct 0.95
+    'tq_convnext_tiny': _cfg(),
+    'tq_convnext_small': _cfg(),
+    'tq_convnext_base': _cfg(),
+    'tq_convnext_large': _cfg(),
 })
 
-
 @register_model
-def convnext_atto(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm femto variant (NOTE: still tweaking depths, will vary between 3-4M param, current is 3.7M
-    model_args = dict(depths=(2, 2, 6, 2), dims=(40, 80, 160, 320), conv_mlp=True)
-    model = _create_convnext('convnext_atto', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_atto_ols(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm femto variant with overlapping 3x3 conv stem, wider than non-ols femto above, current param count 3.7M
-    model_args = dict(depths=(2, 2, 6, 2), dims=(40, 80, 160, 320), conv_mlp=True, stem_type='overlap_tiered')
-    model = _create_convnext('convnext_atto_ols', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_femto(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm femto variant
-    model_args = dict(depths=(2, 2, 6, 2), dims=(48, 96, 192, 384), conv_mlp=True)
-    model = _create_convnext('convnext_femto', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_femto_ols(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm femto variant
-    model_args = dict(depths=(2, 2, 6, 2), dims=(48, 96, 192, 384), conv_mlp=True, stem_type='overlap_tiered')
-    model = _create_convnext('convnext_femto_ols', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_pico(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm pico variant
-    model_args = dict(depths=(2, 2, 6, 2), dims=(64, 128, 256, 512), conv_mlp=True)
-    model = _create_convnext('convnext_pico', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_pico_ols(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm nano variant with overlapping 3x3 conv stem
-    model_args = dict(depths=(2, 2, 6, 2), dims=(64, 128, 256, 512), conv_mlp=True,  stem_type='overlap_tiered')
-    model = _create_convnext('convnext_pico_ols', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_nano(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm nano variant with standard stem and head
-    model_args = dict(depths=(2, 2, 8, 2), dims=(80, 160, 320, 640), conv_mlp=True)
-    model = _create_convnext('convnext_nano', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_nano_ols(pretrained=False, **kwargs) -> ConvNeXt:
-    # experimental nano variant with overlapping conv stem
-    model_args = dict(depths=(2, 2, 8, 2), dims=(80, 160, 320, 640), conv_mlp=True, stem_type='overlap')
-    model = _create_convnext('convnext_nano_ols', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_tiny_hnf(pretrained=False, **kwargs) -> ConvNeXt:
-    # experimental tiny variant with norm before pooling in head (head norm first)
-    model_args = dict(depths=(3, 3, 9, 3), dims=(96, 192, 384, 768), head_norm_first=True, conv_mlp=True)
-    model = _create_convnext('convnext_tiny_hnf', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_tiny(pretrained=False, **kwargs) -> ConvNeXt:
+def tq_convnext_tiny(pretrained=False, **kwargs) -> TQ_ConvNeXt:
     model_args = dict(depths=(3, 3, 9, 3), dims=(96, 192, 384, 768))
-    model = _create_convnext('convnext_tiny', pretrained=pretrained, **dict(model_args, **kwargs))
+    model = _create_tq_convnext('tq_convnext_tiny', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 
 @register_model
-def convnext_small(pretrained=False, **kwargs) -> ConvNeXt:
+def tq_convnext_small(pretrained=False, **kwargs) -> TQ_ConvNeXt:
     model_args = dict(depths=[3, 3, 27, 3], dims=[96, 192, 384, 768])
-    model = _create_convnext('convnext_small', pretrained=pretrained, **dict(model_args, **kwargs))
+    model = _create_tq_convnext('tq_convnext_small', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 
 @register_model
-def convnext_base(pretrained=False, **kwargs) -> ConvNeXt:
+def tq_convnext_base(pretrained=False, **kwargs) -> TQ_ConvNeXt:
     model_args = dict(depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024])
-    model = _create_convnext('convnext_base', pretrained=pretrained, **dict(model_args, **kwargs))
+    model = _create_tq_convnext('tq_convnext_base', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 
 @register_model
-def convnext_large(pretrained=False, **kwargs) -> ConvNeXt:
+def tq_convnext_large(pretrained=False, **kwargs) -> TQ_ConvNeXt:
     model_args = dict(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536])
-    model = _create_convnext('convnext_large', pretrained=pretrained, **dict(model_args, **kwargs))
+    model = _create_tq_convnext('tq_convnext_large', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
-
-
-@register_model
-def convnext_large_mlp(pretrained=False, **kwargs) -> ConvNeXt:
-    model_args = dict(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536], head_hidden_size=1536)
-    model = _create_convnext('convnext_large_mlp', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_xlarge(pretrained=False, **kwargs) -> ConvNeXt:
-    model_args = dict(depths=[3, 3, 27, 3], dims=[256, 512, 1024, 2048])
-    model = _create_convnext('convnext_xlarge', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnext_xxlarge(pretrained=False, **kwargs) -> ConvNeXt:
-    model_args = dict(depths=[3, 4, 30, 3], dims=[384, 768, 1536, 3072], norm_eps=kwargs.pop('norm_eps', 1e-5))
-    model = _create_convnext('convnext_xxlarge', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnextv2_atto(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm femto variant (NOTE: still tweaking depths, will vary between 3-4M param, current is 3.7M
-    model_args = dict(
-        depths=(2, 2, 6, 2), dims=(40, 80, 160, 320), use_grn=True, ls_init_value=None, conv_mlp=True)
-    model = _create_convnext('convnextv2_atto', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnextv2_femto(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm femto variant
-    model_args = dict(
-        depths=(2, 2, 6, 2), dims=(48, 96, 192, 384), use_grn=True, ls_init_value=None, conv_mlp=True)
-    model = _create_convnext('convnextv2_femto', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnextv2_pico(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm pico variant
-    model_args = dict(
-        depths=(2, 2, 6, 2), dims=(64, 128, 256, 512), use_grn=True, ls_init_value=None, conv_mlp=True)
-    model = _create_convnext('convnextv2_pico', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnextv2_nano(pretrained=False, **kwargs) -> ConvNeXt:
-    # timm nano variant with standard stem and head
-    model_args = dict(
-        depths=(2, 2, 8, 2), dims=(80, 160, 320, 640), use_grn=True, ls_init_value=None, conv_mlp=True)
-    model = _create_convnext('convnextv2_nano', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnextv2_tiny(pretrained=False, **kwargs) -> ConvNeXt:
-    model_args = dict(depths=(3, 3, 9, 3), dims=(96, 192, 384, 768), use_grn=True, ls_init_value=None)
-    model = _create_convnext('convnextv2_tiny', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnextv2_small(pretrained=False, **kwargs) -> ConvNeXt:
-    model_args = dict(depths=[3, 3, 27, 3], dims=[96, 192, 384, 768], use_grn=True, ls_init_value=None)
-    model = _create_convnext('convnextv2_small', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnextv2_base(pretrained=False, **kwargs) -> ConvNeXt:
-    model_args = dict(depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024], use_grn=True, ls_init_value=None)
-    model = _create_convnext('convnextv2_base', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnextv2_large(pretrained=False, **kwargs) -> ConvNeXt:
-    model_args = dict(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536], use_grn=True, ls_init_value=None)
-    model = _create_convnext('convnextv2_large', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-@register_model
-def convnextv2_huge(pretrained=False, **kwargs) -> ConvNeXt:
-    model_args = dict(depths=[3, 3, 27, 3], dims=[352, 704, 1408, 2816], use_grn=True, ls_init_value=None)
-    model = _create_convnext('convnextv2_huge', pretrained=pretrained, **dict(model_args, **kwargs))
-    return model
-
-
-register_model_deprecations(__name__, {
-    'convnext_tiny_in22ft1k': 'convnext_tiny.fb_in22k_ft_in1k',
-    'convnext_small_in22ft1k': 'convnext_small.fb_in22k_ft_in1k',
-    'convnext_base_in22ft1k': 'convnext_base.fb_in22k_ft_in1k',
-    'convnext_large_in22ft1k': 'convnext_large.fb_in22k_ft_in1k',
-    'convnext_xlarge_in22ft1k': 'convnext_xlarge.fb_in22k_ft_in1k',
-    'convnext_tiny_384_in22ft1k': 'convnext_tiny.fb_in22k_ft_in1k_384',
-    'convnext_small_384_in22ft1k': 'convnext_small.fb_in22k_ft_in1k_384',
-    'convnext_base_384_in22ft1k': 'convnext_base.fb_in22k_ft_in1k_384',
-    'convnext_large_384_in22ft1k': 'convnext_large.fb_in22k_ft_in1k_384',
-    'convnext_xlarge_384_in22ft1k': 'convnext_xlarge.fb_in22k_ft_in1k_384',
-    'convnext_tiny_in22k': 'convnext_tiny.fb_in22k',
-    'convnext_small_in22k': 'convnext_small.fb_in22k',
-    'convnext_base_in22k': 'convnext_base.fb_in22k',
-    'convnext_large_in22k': 'convnext_large.fb_in22k',
-    'convnext_xlarge_in22k': 'convnext_xlarge.fb_in22k',
-})

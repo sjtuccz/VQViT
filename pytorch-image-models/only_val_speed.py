@@ -149,7 +149,7 @@ parser.add_argument('--tome-r', type=int, default=8,
                     help='token merging ratio .')
 # test param
 parser.add_argument('-b', '--batch-size', default=128, type=int,
-                    metavar='N', help='mini-batch size (default: 256)')
+                    metavar='N', help='mini-batch size (default: 128)')
 parser.add_argument('--warmup', type=int, default=20,
                     help='token merging ratio .')
 parser.add_argument('--num-batches', type=int, default=500,

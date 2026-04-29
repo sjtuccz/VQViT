@@ -424,38 +424,39 @@ class TQ_MetaFormerBlock_TQ_FFN(nn.Module):
         self.token_wise_rep = False
         self.dim = dim
         self.use_nchw = use_nchw
+        self.register_buffer("rep_codebook", torch.tensor(0))
     def reparameterize(self):
         ''' 
         reparameterize the tq dict and calculate the rep_codebook for inference, 
         the case where the codebook is not a square matrix has also been taken into consideration. 
         '''
-        print('using Block reparameterize')
+        print('using TQ-MetaformerBlock reparameterize')
         self.token_wise_rep = True
-        self.rep_codebook = nn.Embedding(self.tq.codebook_size, self.dim)
+        # self.rep_codebook = nn.Embedding(self.tq.codebook_size, self.dim)
         # print(self.dim)
         fixed_codebook = self.tq.reparameterize() # (codebook size, dim)
         if self.use_nchw:
-            N, D = fixed_codebook.shape[0], fixed_codebook.shape[1]
-            fixed_codebook_transposed = fixed_codebook.transpose(0, 1).contiguous() # N, D -> D, N
+            HW, C = fixed_codebook.shape[0], fixed_codebook.shape[1]
+            fixed_codebook_transposed = fixed_codebook.transpose(0, 1).contiguous() # HW,C-> C, HW
             # handle the case where N is not a perfect square number for Conv
-            h = int(torch.sqrt(torch.tensor(N)).ceil().item())
-            w = (N + h - 1) // h
-            if h * w > N:
-                pad_size = h * w - N
-                x_padded = torch.cat([fixed_codebook_transposed, torch.zeros(D, pad_size, device=fixed_codebook_transposed.device)], dim=1)
+            h = int(torch.sqrt(torch.tensor(HW)).ceil().item())
+            w = (HW + h - 1) // h
+            if h * w > HW:
+                pad_size = h * w - HW
+                x_padded = torch.cat([fixed_codebook_transposed, torch.zeros(C, pad_size, device=fixed_codebook_transposed.device)], dim=1)
             else:
                 x_padded = fixed_codebook_transposed
-            fixed_codebook_rep = x_padded.reshape(1, D,h,w) # (1, D, h, w)
+            fixed_codebook_rep = x_padded.reshape(1, C,h,w) # (1, C, h, w)
             x = self.mlp(fixed_codebook_rep)
             x = self.layer_scale2(x)
-            x = x.reshape(D, -1) # (D, h*w)
-            if h * w > N:
-                x = x[:, :N].contiguous() # (D, N)
+            x = x.reshape(C, -1) # (C, h*w)
+            if h * w > HW:
+                x = x[:, :HW].contiguous() # (C, HW)
             x = x.transpose(0, 1).contiguous() # (N, D)
         else:
             x = self.mlp(fixed_codebook)
             x = self.layer_scale2(x)
-        self.rep_codebook.weight.data.copy_(x)
+        self.rep_codebook=x.data.contiguous()
         del self.mlp
         del self.layer_scale2
 
@@ -471,7 +472,7 @@ class TQ_MetaFormerBlock_TQ_FFN(nn.Module):
         x = self.norm2(x)
         if self.token_wise_rep:
             embedding_index =  self.tq(x)
-            z_q = self.rep_codebook(embedding_index)
+            z_q = self.rep_codebook[embedding_index]
             if self.use_nchw:
                 x = z_q.transpose(1, 2).reshape(res.shape)
             else:
@@ -523,15 +524,10 @@ class TQ_MetaFormerStage(nn.Module):
             norm_layer=downsample_norm,
         )
 
-
-        prefix_sum_exclusive = [0]
-        total = 0
-        for i in range(len(stage_depth_list)-1):
-            total += stage_depth_list[i]
-            prefix_sum_exclusive.append(total)
         blocks = []
         for i in range(stage_depth_list[stage_index]):
-            if (prefix_sum_exclusive[stage_index]+i)%2 == start_tq_ffn_index:
+            sum_depth_index = sum(stage_depth_list[:stage_index])+i
+            if sum_depth_index%2 == start_tq_ffn_index:
                  blocks.append(TQ_MetaFormerBlock_TQ_FFN(
                     dim=out_chs,
                     token_mixer=token_mixer,

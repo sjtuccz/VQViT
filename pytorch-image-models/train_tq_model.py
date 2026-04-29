@@ -494,8 +494,8 @@ def main():
         num_classes=args.num_classes,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
-        attn_drop_rate=args.attn_drop_rate,
-        proj_drop_rate=args.proj_drop_rate,
+        # attn_drop_rate=args.attn_drop_rate,
+        # proj_drop_rate=args.proj_drop_rate,
         drop_block_rate=args.drop_block,
         global_pool=args.gp,
         bn_momentum=args.bn_momentum,
@@ -1080,7 +1080,18 @@ def train_one_epoch(
                             mode=args.clip_mode,
                         )
                     optimizer.step()
-
+        #--------------------------------------
+        # 下面的代码是为了调试梯度不连续的问题，正常情况下应该注释掉
+        # for name, param in model.named_parameters():
+        #     if param.grad is not None:
+        #     # 检查梯度的 strides 是否连续
+        #     # 正常的 strides 应该是 [49, 49, 7, 1] 这种递减的
+        #     # 报错的 strides 是 [49, 1, 7, 1] 这种跳跃的
+        #         if not param.grad.is_contiguous():
+        #             print(f"⚠️ 发现不连续梯度: {name}, shape: {param.grad.shape}, strides: {param.grad.stride()}")
+        #         if param.shape == (768, 1, 7, 7):
+        #             print(f"⚠️ 发现异常梯度: {name}, shape: {param.grad.shape}, strides: {param.grad.stride()}")
+        #--------------------------------------
         if has_no_sync and not need_update:
             with model.no_sync():
                 loss = _forward()
