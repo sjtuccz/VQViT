@@ -109,6 +109,8 @@ group.add_argument('--model', default='resnet50', type=str, metavar='MODEL',
                    help='Name of model to train (default: "resnet50")')
 group.add_argument('--pretrained', action='store_true', default=False,
                    help='Start with pretrained version of specified network (if avail)')
+group.add_argument('--freeze-backbone', action='store_true', default=False,
+                   help='Freeze backbone layers and only train the head (default: False)')
 group.add_argument('--pretrained-finetune', action='store_true', default=False,
                    help='use different lr for pretrained layers and head (default: False)')
 group.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
@@ -128,7 +130,7 @@ group.add_argument('--in-chans', type=int, default=None, metavar='N',
 group.add_argument('--input-size', default=None, nargs=3, type=int,
                    metavar='N N N',
                    help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
-group.add_argument('--crop-pct', default=0.875, type=float,
+group.add_argument('--crop-pct', default=None, type=float,
                    metavar='N', help='Input image center crop percent (for validation only)')
 group.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
                    help='Override mean pixel value of dataset')
@@ -367,7 +369,21 @@ group.add_argument('--log-wandb', action='store_true', default=False,
 
 parser.add_argument('--eval-checkpoint', default='', type=str, metavar='PATH',
                     help='path to eval checkpoint (default: none)')
+def print_frozen_layers(model):
+            frozen = 0
+            trainable = 0
+            print("\n===== 模型层冻结状态检查 =====")
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    trainable += 1
+                    print(f"✅ 可训练: {name}")
+                else:
+                    frozen += 1
+                    print(f"❌ 已冻结: {name}")
 
+            print(f"\n✅ 可训练参数总数: {trainable}")
+            print(f"❌ 已冻结参数总数: {frozen}")
+            print(f"====================================\n")
 def _parse_args():
     # Do we have a config file to parse?
     args_config, remaining = config_parser.parse_known_args()
@@ -383,7 +399,33 @@ def _parse_args():
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
-
+def freeze_backbone_unfreeze_head(model):
+    """
+    冻结除 head 之外的所有层，并仅优化 head 的参数
+    """
+    # 1. 第一步：冻结整个模型的所有参数
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # 2. 第二步：利用你提供的接口获取 classifier (head)
+    # 假设 get_classifier() 返回的是 self.head.fc
+    classifier = model.get_classifier()
+    
+    # 3. 第三步：解冻 classifier 及其内部的所有参数
+    # 使用 .modules() 确保如果 head 是一个包含多层的 Sequential，也能全部解冻
+    for module in classifier.modules():
+        if hasattr(module, 'weight'): # 简单的检查，确保是有参数的层
+             for param in module.parameters():
+                param.requires_grad = True
+            
+    # 4. 第四步：构建优化器（关键！只传入需要训练的参数）
+    # 这样既节省显存，又能加快训练速度
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    
+    print(f"🧊 已冻结主干网络，仅训练 Head 层。")
+    print(f"📊 可训练参数量: {sum(p.numel() for p in trainable_params) / 1e6:.2f} M")
+    
+    return model
 
 def main():
     utils.setup_default_logging()
@@ -434,28 +476,28 @@ def main():
 
     if 'cifar100' in args.dataset:
         args.data_dir = '../../pytorch-cifar100-master/data/'
-        args.mean = CIFAR100_TRAIN_MEAN
-        args.std = CIFAR100_TRAIN_STD
+        # args.mean = CIFAR100_TRAIN_MEAN
+        # args.std = CIFAR100_TRAIN_STD
         args.num_classes = 100
     elif 'cifar10' in args.dataset:
         args.data_dir = '../../pytorch-cifar100-master/data/cifar10download/'
-        args.mean = CIFAR10_MEAN
-        args.std = CIFAR10_STD
+        # args.mean = CIFAR10_MEAN
+        # args.std = CIFAR10_STD
         args.num_classes = 10
     elif 'tiny-imagenet' in args.dataset:
         args.data_dir = '../../tiny-imagenet-200/'
-        args.mean = IMAGENET_DEFAULT_MEAN#TINY_IMAGENET_MEAN
-        args.std = IMAGENET_DEFAULT_STD#TINY_IMAGENET_STD
+        # args.mean = IMAGENET_DEFAULT_MEAN#TINY_IMAGENET_MEAN
+        # args.std = IMAGENET_DEFAULT_STD#TINY_IMAGENET_STD
         args.num_classes = 200
     elif 'imagenet1k' in args.dataset:
         args.data_dir = '../../ImageNet2012/'
-        args.mean = IMAGENET_DEFAULT_MEAN
-        args.std = IMAGENET_DEFAULT_STD
+        # args.mean = IMAGENET_DEFAULT_MEAN
+        # args.std = IMAGENET_DEFAULT_STD
         args.num_classes = 1000
     elif 'imagenet100' in args.dataset:
         args.data_dir = '../../imagenet100/'
-        args.mean = IMAGENET_DEFAULT_MEAN
-        args.std = IMAGENET_DEFAULT_STD
+        # args.mean = IMAGENET_DEFAULT_MEAN
+        # args.std = IMAGENET_DEFAULT_STD
         args.num_classes = 100
     else:
         raise NotImplementedError(f'Unknown dataset {args.dataset}')
@@ -474,6 +516,8 @@ def main():
         bn_eps=args.bn_eps,
         scriptable=args.torchscript,
         checkpoint_path=args.initial_checkpoint,
+        is_filte_statedict=True,
+        # strict = False,
         **args.model_kwargs,
     )
     # def modify_model_param(model, layer_name_1, layer_name_2, param_name, isZero=False):
@@ -689,7 +733,8 @@ def main():
         # torch compile should be done after DDP
         assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
         model = torch.compile(model, backend=args.torchcompile)
-
+    if args.freeze_backbone:
+        model = freeze_backbone_unfreeze_head(model)
     # create the train and eval datasets
     if args.data and not args.data_dir:
         args.data_dir = args.data
@@ -1054,7 +1099,8 @@ def train_one_epoch(
                             mode=args.clip_mode,
                         )
                     optimizer.step()
-
+        
+        # print_frozen_layers(model)
         if has_no_sync and not need_update:
             with model.no_sync():
                 loss = _forward()

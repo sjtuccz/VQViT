@@ -503,6 +503,7 @@ class TQ_VisionTransformer(nn.Module):
         block_list = list()
        # ========== vanilla ATTN + tq FFN  ==========
         # block_list=[Block_TQ_FFN(
+        # block_list=[Block_TQ_ATTN(
         #         dim=embed_dim,
         #         num_heads=num_heads,
         #         mlp_ratio=mlp_ratio,

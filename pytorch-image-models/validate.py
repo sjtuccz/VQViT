@@ -165,22 +165,29 @@ parser.add_argument('--tome', action='store_true', default=False,
                     help='applying token merging .')
 parser.add_argument('--tome-r', type=int, default=8,
                     help='token merging ratio .')
-
 def add_attention_qkvMatDot_FLOPs(flops, model_name, tome, tome_r)-> int:
-    if 'vit_tiny_patch16_224' in model_name:
+    print(model_name)
+    if tome and 'tq' in model_name:
+        tome='tomea'
+    elif tome and 'tq' not in model_name:
+        tome='tome'
+    else:
+        tome='none'
+    if 'vit_tiny_patch16_224' in model_name or 'deit_tiny_patch16_224' in model_name:
         return flops + cal_qkvMatDot_FLOPs(tome, tome_r, batch=1,head_num=3,seq_len=197,dim=192,block_num=12)
-    elif 'vit_small_patch16_224' in model_name:
+    elif 'vit_small_patch16_224' in model_name or 'deit_small_patch16_224' in model_name :
         return flops + cal_qkvMatDot_FLOPs(tome, tome_r, batch=1,head_num=6,seq_len=197,dim=384,block_num=12)
-    elif 'vit_base_patch16_224' in model_name:
+    elif 'vit_base_patch16_224' in model_name or 'deit_base_patch16_224' in model_name:
         return flops + cal_qkvMatDot_FLOPs(tome, tome_r, batch=1,head_num=12,seq_len=197,dim=768,block_num=12)
-    elif 'vit_large_patch16_224' in model_name:
+    elif 'vit_large_patch16_224' in model_name or 'deit_large_patch16_224' in model_name:
         return flops + cal_qkvMatDot_FLOPs(tome, tome_r, batch=1,head_num=16,seq_len=197,dim=1024,block_num=24)
-    elif 'vit_small_patch32_224' in model_name:
+    elif 'vit_small_patch32_224' in model_name or 'deit_small_patch32_224' in model_name:
         return flops + cal_qkvMatDot_FLOPs(tome, tome_r, batch=1,head_num=6,seq_len=50,dim=384,block_num=12)
-    elif 'vit_small_patch16_384' in model_name:
+    elif 'vit_small_patch16_384' in model_name or 'deit_small_patch16_384' in model_name:
         return flops + cal_qkvMatDot_FLOPs(tome, tome_r, batch=1,head_num=6,seq_len=577,dim=384,block_num=12)
     else:
-        print("Model attention qkvMatDot FLOPs not added!")
+        # raise ValueError(f"Model {model_name} qkvMatDot FLOPs not supported!")
+        print(f"    WARN: Model {model_name} attention qkvMatDot FLOPs not added!")
         return flops
     
     
@@ -212,24 +219,23 @@ def cal_qkvMatDot_FLOPs(tome, tome_r, batch=1,head_num=6,seq_len=197,dim=384,blo
     n = seq_len
     d=dim//head_num
     FLOPs = 0
-    if tome:
-
-        # n = n - tome_r
-        # FLOPs= 0.5*block_num*(b*h*n*d + (2*d-1)*n*n*b*h + 3*b*h*n*n-1 + (2*n-1)*n*d*b*h)
+    # for vanilla tome:
+    if tome=='tome':
         origin_n = n
-        tome_n = origin_n - tome_r
         for i in range(block_num):
-            n = tome_n if i%2==0 else origin_n
+            n = origin_n-i*tome_r
+            FLOPs+=0.5*(b*h*n*d + (2*d-1)*n*n*b*h + 3*b*h*n*n-1 + (2*n-1)*n*d*b*h)
+    #  for our tomeA:
+    elif tome=='tomea':
+        origin_n = n
+        for i in range(block_num):
+            if i%2==0 and i!=0:
+                n=n-tome_r
             print(n)
             FLOPs+=0.5*(b*h*n*d + (2*d-1)*n*n*b*h + 3*b*h*n*n-1 + (2*n-1)*n*d*b*h)
-        # for i in range(block_num):
-        #     n = n-i*tome_r if n-i*tome_r>seq_len//2 else (seq_len//2 +1)
-        #     print(n)
-        #     FLOPs+=0.5*(b*h*n*d + (2*d-1)*n*n*b*h + 3*b*h*n*n-1 + (2*n-1)*n*d*b*h)
     else:
         FLOPs= 0.5*block_num*(b*h*n*d + (2*d-1)*n*n*b*h + 3*b*h*n*n-1 + (2*n-1)*n*d*b*h)
     return FLOPs
-
 def format_param_count(param_count, decimal_places=2):
     if param_count >= 1e9:
         return f"{round(param_count / 1e9, decimal_places)}B" 

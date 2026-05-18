@@ -248,9 +248,9 @@ class TQ_ConvNeXtBlock(nn.Module):
             x = self.mlp(fixed_codebook) # (HW, C)
             if self.gamma is not None:
                 x = x.mul(self.gamma.reshape(1, -1)) # (HW, C)
-            self.rep_codebook=x.data.contiguous()
-            del self.mlp
-            del self.gamma
+        self.rep_codebook=x.data.contiguous()
+        del self.mlp
+        del self.gamma
 
 
     def forward(self, x):

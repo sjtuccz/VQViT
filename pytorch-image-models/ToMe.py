@@ -428,7 +428,6 @@ class ToMeAttention(Attention):
         )
         q, k, v =torch.unbind(qkv,dim=0)
         attn = (q @ k.transpose(-2, -1)) * self.scale
-
         # Apply proportional attention
         if size is not None:
             attn = attn + size.log()[:, None, None, :, 0]
