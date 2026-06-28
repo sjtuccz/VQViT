@@ -7,11 +7,13 @@ from einops import rearrange, pack, unpack
 from timm.layers import trunc_normal_
 
 
-def choose_tq(tq_type, dic_n, dim, dic_dim, tq_level=[3,3,3,3], tq_Tinit=1, input_format='NLC'):
+def choose_tq(tq_type, dic_n, dim, dic_dim=4, tq_level=[3,3,3,3], tq_Tinit=1, input_format='NLC'):
     if tq_type == 'TQ' or tq_type == 'tq':
         return TQ_Qscale_deQscale(channels_in=dim, channels_dim=dic_dim, levels=tq_level, T=tq_Tinit, input_format=input_format)
+    elif tq_type == 'no_codebook':
+        return TQ_wo_codebook(channels_in=dim, channels_dim=dic_dim, levels=tq_level, T=tq_Tinit, input_format=input_format)
     else:
-        raise RuntimeError('tq type not implemented')
+        raise RuntimeError(f'tq type {tq_type} not implemented')
     
 VALID_INPUT_FORMATS = {"NLC", "NCHW", "NHWC"}
 
@@ -23,6 +25,11 @@ class TQ_Qscale_deQscale(nn.Module):
         super().__init__()
         self.compress = nn.Linear(channels_in, channels_dim)
         self.expand = nn.Linear(channels_dim, channels_in)
+        # 措施1：初始化为恒等映射
+        # nn.init.eye_(self.compress.weight[:, :channels_dim])
+        # nn.init.eye_(self.expand.weight[:channels_dim, :])
+        # nn.init.zeros_(self.compress.bias)
+        # nn.init.zeros_(self.expand.bias)
         assert len(levels) == channels_dim, "ensure len(levels) == channels_dim"
         assert all(element % 2 == 1 for element in levels), f"levels must be odd numbers, but: {levels}"
         assert input_format in VALID_INPUT_FORMATS, \
@@ -124,6 +131,7 @@ class TQ_Qscale_deQscale(nn.Module):
             return z.mul_(self._inv_T_raw).tanh_().mul_(self.half_l).round().mul_(self._inv_scale_factor)
         # return self.round_ste((2*torch.sigmoid(1.6*z)-1) * self.half_l)/ self.half_l
         # return self.round_ste((2*torch.sigmoid(1.6*z/self.T_raw)-1) * self.half_l)/ self.half_l *self.anti_q
+        # return self.round_ste(torch.clip(z/self.T_raw, -1, 1) * self.half_l)/ self.half_l *self.anti_q
         return self.round_ste(torch.tanh(z/self.T_raw) * self.half_l)/ self.half_l *self.anti_q
 
     def codes_to_indices(self, zhat):
@@ -168,3 +176,46 @@ class CodebookMeter:
         """返回当前累计的码本利用率"""
         return torch.sum(self.register_mask).item() / self.codebook_size
 
+class TQ_wo_codebook(nn.Module):
+    '''
+    Based on vanilla TQ, quantization scaling factor & dequantization scaling factor have been added.
+    '''
+    def __init__(self, channels_in, channels_dim, levels=[3,3,3], T=1, input_format='NLC'):
+        super().__init__()
+        print("================================================using TQ without codebook")
+        self.compress = nn.Linear(channels_in, channels_dim)
+        self.expand = nn.Linear(channels_dim, channels_in)
+        assert len(levels) == channels_dim, "ensure len(levels) == channels_dim"
+        assert all(element % 2 == 1 for element in levels), f"levels must be odd numbers, but: {levels}"
+        assert input_format in VALID_INPUT_FORMATS, \
+        f'input_format must be {list(VALID_INPUT_FORMATS)}, but: {input_format}'
+
+        self.input_format = input_format  # 'nhc' or 'nch' or None
+        self.fold_dim = None  # to be set if needed
+
+        nn.init.orthogonal_(self.compress.weight)
+        nn.init.orthogonal_(self.expand.weight)
+        nn.init.zeros_(self.compress.bias)
+        nn.init.zeros_(self.expand.bias)
+
+
+    def forward(self, z):
+        '''
+        z: (b, h , channels_in)
+        '''
+        input = z
+        if self.input_format == 'NCHW':
+            z = z.flatten(2).transpose(1, 2) #->(N, L, C)
+        elif self.input_format == 'NHWC':
+            z = z.flatten(1, 2) # (N, H, W, C) -> (N, L, C)
+        z = self.compress(z) # (b, h , dim)
+        z_q = self.expand(z)
+        if self.input_format == 'NLC':
+            return z_q
+        elif self.input_format == 'NCHW':
+            z_q = z_q.transpose(1, 2).view(input.shape)
+            return z_q
+        elif self.input_format == 'NHWC':
+            z_q = z_q.view(input.shape)
+            return z_q
+    
